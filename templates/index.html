@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}PDF Analyzer - Home{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1>PDF Analyzer</h1>
+    <p class="subtitle">Welcome to your AI-powered PDF analysis project.</p>
+
+    <div class="upload-card">
+        <form action="{{ url_for('pdf.upload_pdf') }}" method="POST" enctype="multipart/form-data" class="upload-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="pdf_file" class="file-label">Select a PDF file to analyze:</label>
+            <input type="file" name="pdf_file" id="pdf_file" accept=".pdf" required class="file-input">
+            <span class="file-hint">Accepted format: .pdf (Max size: 10 MB)</span>
+            <button type="submit" class="btn-upload">Upload PDF</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

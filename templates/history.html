@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Document History - PDF Analyzer{% endblock %}
+
+{% block content %}
+<div class="history-container">
+    <div class="history-header">
+        <h1>Document History</h1>
+        <p class="subtitle">All successfully processed PDF documents, newest first.</p>
+    </div>
+
+    {% if documents %}
+    <div class="table-card">
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Original Filename</th>
+                    <th>Upload Time</th>
+                    <th>Pages</th>
+                    <th>Characters</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for doc in documents %}
+                <tr>
+                    <td class="col-id">{{ doc.id }}</td>
+                    <td class="col-filename">
+                        <span class="file-title">{{ doc.original_filename }}</span>
+                        <span class="stored-name">Stored as: {{ doc.filename }}</span>
+                    </td>
+                    <td class="col-time">{{ doc.upload_time }}</td>
+                    <td class="col-pages">{{ doc.page_count }}</td>
+                    <td class="col-chars">{{ doc.character_count }}</td>
+                    <td class="col-status">
+                        <span class="status-badge status-{{ doc.status }}">{{ doc.status }}</span>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-history-card">
+        <p class="empty-icon">&#128196;</p>
+        <h2>No Documents Uploaded Yet</h2>
+        <p class="empty-description">You haven't uploaded any PDF documents yet. Upload your first PDF to see it here.</p>
+        <a href="{{ url_for('pdf.index') }}" class="btn-primary">Upload a PDF</a>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
