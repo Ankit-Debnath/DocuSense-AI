@@ -861,6 +861,154 @@ startxref
         self.assertIn("This page contains no extractable text", html)
         self.assertNotIn("raw-text-accordion", html)
 
+    def test_ask_endpoint_performs_single_extraction(self):
+        """Test A (F-01 Regression): Verify /ask executes PDF extraction exactly once per request."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Single extraction doc) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "single_extract.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+
+        with patch("routes.pdf_routes.extract_text_from_pdf") as mock_extract, \
+             patch("routes.pdf_routes.answer_pdf_question") as mock_ask:
+            mock_extract.return_value = {
+                "success": True,
+                "total_pages": 1,
+                "total_characters": 22,
+                "has_extractable_text": True,
+                "pages": [{"page_number": 1, "text": "Single extraction doc", "char_count": 22}],
+                "error": None
+            }
+            mock_ask.return_value = {
+                "success": True,
+                "answer": "Answer grounded on page 1.",
+                "page_citations": [1],
+                "evidence_passages": [{"page_number": 1, "text": "Single extraction doc"}],
+                "model_used": "gemini-flash-lite-latest"
+            }
+
+            res = self.client.post("/ask", data={
+                "stored_filename": "single_extract.pdf",
+                "original_filename": "single_extract.pdf",
+                "question": "What is in this file?",
+                "csrf_token": token
+            })
+            self.assertEqual(res.status_code, 200)
+            # Verify single extraction call on actual route execution
+            self.assertEqual(mock_extract.call_count, 1)
+
+    def test_ask_endpoint_bounded_session_cookie(self):
+        """Test B (F-02 Regression): Simulate 5+ consecutive Q&A turns and assert Set-Cookie is strictly < 1024 bytes and omits raw passages."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Cookie bounded doc) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "cookie_bound.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+
+        # Large evidence passages to prove full text is NOT stored in session
+        large_evidence_text = "VERY_LARGE_PASSAGE_TEXT_BLOCK_NOT_TO_BE_STORED_IN_COOKIE_" * 20
+
+        with patch("routes.pdf_routes.answer_pdf_question") as mock_ask:
+            for turn in range(1, 7):  # 6 consecutive turns
+                mock_ask.return_value = {
+                    "success": True,
+                    "answer": f"Turn {turn} analysis: System achieves optimal latency and throughput under constraints.",
+                    "page_citations": [turn, turn + 1],
+                    "evidence_passages": [
+                        {"page_number": turn, "text": f"{large_evidence_text} {turn}", "chunk_id": turn}
+                    ],
+                    "model_used": "gemini-flash-lite-latest"
+                }
+
+                res = self.client.post("/ask", data={
+                    "stored_filename": "cookie_bound.pdf",
+                    "original_filename": "cookie_bound.pdf",
+                    "question": f"Question {turn}: What is the evaluation result for benchmark {turn}?",
+                    "csrf_token": token
+                })
+                self.assertEqual(res.status_code, 200)
+
+                # Inspect Set-Cookie header length on each turn
+                set_cookie_headers = res.headers.getlist("Set-Cookie")
+                self.assertTrue(len(set_cookie_headers) > 0)
+                for header in set_cookie_headers:
+                    if header.startswith("session="):
+                        self.assertLess(len(header), 1024, f"Set-Cookie header on turn {turn} exceeded 1024 bytes: {len(header)} bytes")
+
+            # Inspect final session state
+            with self.client.session_transaction() as sess:
+                history = sess.get("qa_history_cookie_bound.pdf", [])
+                self.assertLessEqual(len(history), 5)  # Enforces MAX_QA_HISTORY_TURNS
+                for item in history:
+                    # Assert full evidence passages are not stored in the session
+                    self.assertNotIn("evidence_passages", item)
+                    self.assertNotIn(large_evidence_text, str(item))
+
+            # Verify Clear History functionality
+            res_clear = self.client.post("/ask", data={
+                "stored_filename": "cookie_bound.pdf",
+                "original_filename": "cookie_bound.pdf",
+                "clear_chat": "true",
+                "csrf_token": token
+            })
+            self.assertEqual(res_clear.status_code, 200)
+            with self.client.session_transaction() as sess:
+                self.assertNotIn("qa_history_cookie_bound.pdf", sess)
+
+    def test_ask_followup_compatibility_and_citation_display(self):
+        """Test C: Verify follow-up questions render conversation history and citation badges properly."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Follow up test doc) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "followup_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+
+        with patch("routes.pdf_routes.answer_pdf_question") as mock_ask:
+            # Turn 1
+            mock_ask.return_value = {
+                "success": True,
+                "answer": "First turn answer explaining core concepts.",
+                "page_citations": [1],
+                "model_used": "gemini-flash-lite-latest"
+            }
+            res1 = self.client.post("/ask", data={
+                "stored_filename": "followup_doc.pdf",
+                "original_filename": "followup_doc.pdf",
+                "question": "Initial question about architecture?",
+                "csrf_token": token
+            })
+            self.assertEqual(res1.status_code, 200)
+
+            # Turn 2 (Follow-up)
+            mock_ask.return_value = {
+                "success": True,
+                "answer": "Follow-up turn answer explaining mathematical formulation.",
+                "page_citations": [2],
+                "model_used": "gemini-flash-lite-latest"
+            }
+            res2 = self.client.post("/ask", data={
+                "stored_filename": "followup_doc.pdf",
+                "original_filename": "followup_doc.pdf",
+                "question": "Follow-up question about loss formulation?",
+                "csrf_token": token
+            })
+            self.assertEqual(res2.status_code, 200)
+            html = res2.data.decode("utf-8")
+
+            # Verify both turns are displayed in conversation history
+            self.assertIn("Initial question about architecture?", html)
+            self.assertIn("First turn answer explaining core concepts.", html)
+            self.assertIn("Follow-up question about loss formulation?", html)
+            self.assertIn("Follow-up turn answer explaining mathematical formulation.", html)
+
+            # Verify citation pills are rendered
+            self.assertIn('data-page="1"', html)
+            self.assertIn('data-page="2"', html)
+            self.assertIn("page-citation-pill", html)
+
 
 if __name__ == "__main__":
     unittest.main()

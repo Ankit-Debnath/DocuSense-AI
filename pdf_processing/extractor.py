@@ -34,50 +34,51 @@ def extract_text_from_pdf(file_path: str) -> Dict[str, Any]:
     }
 
     try:
-        reader = pypdf.PdfReader(file_path)
+        with open(file_path, "rb") as stream:
+            reader = pypdf.PdfReader(stream)
 
-        # Handle encrypted / password-protected PDFs
-        if reader.is_encrypted:
-            try:
-                # Attempt empty password in case of standard encryption without user password
-                decrypted = reader.decrypt("")
-                if decrypted == 0:
-                    result["error"] = "This PDF is password-protected. Please provide an unencrypted PDF."
+            # Handle encrypted / password-protected PDFs
+            if reader.is_encrypted:
+                try:
+                    # Attempt empty password in case of standard encryption without user password
+                    decrypted = reader.decrypt("")
+                    if decrypted == 0:
+                        result["error"] = "This PDF is password-protected. Please provide an unencrypted PDF."
+                        return result
+                except Exception:
+                    result["error"] = "This PDF is password-protected and cannot be read."
                     return result
-            except Exception:
-                result["error"] = "This PDF is password-protected and cannot be read."
+
+            num_pages = len(reader.pages)
+            result["total_pages"] = num_pages
+
+            if num_pages == 0:
+                result["success"] = True
+                result["error"] = "This PDF document contains no pages."
                 return result
 
-        num_pages = len(reader.pages)
-        result["total_pages"] = num_pages
+            total_chars = 0
+            extracted_pages: List[Dict[str, Any]] = []
 
-        if num_pages == 0:
+            for index, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = page.extract_text() or ""
+                except Exception:
+                    page_text = ""
+
+                page_char_count = len(page_text.strip())
+                total_chars += page_char_count
+
+                extracted_pages.append({
+                    "page_number": index,
+                    "text": page_text,
+                    "char_count": page_char_count,
+                })
+
             result["success"] = True
-            result["error"] = "This PDF document contains no pages."
-            return result
-
-        total_chars = 0
-        extracted_pages: List[Dict[str, Any]] = []
-
-        for index, page in enumerate(reader.pages, start=1):
-            try:
-                page_text = page.extract_text() or ""
-            except Exception:
-                page_text = ""
-
-            page_char_count = len(page_text.strip())
-            total_chars += page_char_count
-
-            extracted_pages.append({
-                "page_number": index,
-                "text": page_text,
-                "char_count": page_char_count,
-            })
-
-        result["success"] = True
-        result["pages"] = extracted_pages
-        result["total_characters"] = total_chars
-        result["has_extractable_text"] = total_chars > 0
+            result["pages"] = extracted_pages
+            result["total_characters"] = total_chars
+            result["has_extractable_text"] = total_chars > 0
 
         return result
 

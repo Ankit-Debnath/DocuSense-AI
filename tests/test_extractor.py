@@ -109,6 +109,41 @@ startxref
         self.assertFalse(result["success"])
         self.assertIsNotNone(result["error"])
 
+    def test_file_handle_released_on_successful_extraction(self):
+        """Test that file handle is closed deterministically and file can be deleted immediately after success."""
+        filepath = os.path.join(self.test_dir, "release_success.pdf")
+        self._create_pdf_with_text(filepath)
+
+        result = extract_text_from_pdf(filepath)
+        self.assertTrue(result["success"])
+        self.assertGreater(result["total_characters"], 0)
+
+        # On Windows, an unclosed handle will raise PermissionError (WinError 32: sharing violation)
+        try:
+            os.remove(filepath)
+        except PermissionError as pe:
+            self.fail(f"File handle remained open after successful extraction: {pe}")
+
+        self.assertFalse(os.path.exists(filepath))
+
+    def test_file_handle_released_on_failed_extraction(self):
+        """Test that file handle is closed deterministically and file can be deleted immediately after failure."""
+        filepath = os.path.join(self.test_dir, "release_failure.pdf")
+        with open(filepath, "wb") as f:
+            f.write(b"%PDF-1.4\nCorrupted truncated stream that fails parsing")
+
+        result = extract_text_from_pdf(filepath)
+        self.assertFalse(result["success"])
+        self.assertIsNotNone(result["error"])
+
+        # On Windows, an unclosed handle will raise PermissionError (WinError 32: sharing violation)
+        try:
+            os.remove(filepath)
+        except PermissionError as pe:
+            self.fail(f"File handle remained open after failed extraction: {pe}")
+
+        self.assertFalse(os.path.exists(filepath))
+
 
 if __name__ == "__main__":
     unittest.main()

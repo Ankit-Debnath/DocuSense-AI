@@ -1255,6 +1255,34 @@ button.page-citation-pill:hover {
     color: #065f46;
 }
 
+.col-action {
+    text-align: right;
+    white-space: nowrap;
+}
+
+.btn-view-analysis {
+    display: inline-block;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.825rem;
+    font-weight: 500;
+    text-decoration: none;
+    border-radius: 6px;
+    background: #f1f5f9;
+    color: #2563eb;
+    border: 1px solid #cbd5e1;
+    transition: all 0.15s ease;
+}
+
+.btn-view-analysis:hover {
+    background: #2563eb;
+    color: #ffffff;
+    border-color: #2563eb;
+}
+
+.status-disabled {
+    color: #94a3b8;
+}
+
 /* Empty History Card */
 .empty-history-card {
     background: #ffffff;

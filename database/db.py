@@ -59,9 +59,18 @@ def init_db(db_path=None):
             upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             page_count INTEGER NOT NULL,
             character_count INTEGER NOT NULL,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            content_hash TEXT
         );
     """)
+
+    # Safe backward-compatible migration: add content_hash column if missing in legacy databases
+    cursor.execute("PRAGMA table_info(documents);")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "content_hash" not in columns:
+        cursor.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT;")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash);")
 
     # Create document_summaries cache table to prevent redundant re-summarization
     cursor.execute("""

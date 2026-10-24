@@ -16,6 +16,7 @@ def insert_document(
     page_count: int,
     character_count: int,
     status: str = "processed",
+    content_hash: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> int:
     """
@@ -29,10 +30,10 @@ def insert_document(
     cursor = conn.cursor()
 
     query = """
-        INSERT INTO documents (filename, original_filename, page_count, character_count, status)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO documents (filename, original_filename, page_count, character_count, status, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?)
     """
-    cursor.execute(query, (filename, original_filename, page_count, character_count, status))
+    cursor.execute(query, (filename, original_filename, page_count, character_count, status, content_hash))
     conn.commit()
 
     doc_id = cursor.lastrowid
@@ -50,7 +51,7 @@ def get_all_documents(db_path: Optional[str] = None) -> List[sqlite3.Row]:
     cursor = conn.cursor()
 
     query = """
-        SELECT id, filename, original_filename, upload_time, page_count, character_count, status
+        SELECT id, filename, original_filename, upload_time, page_count, character_count, status, content_hash
         FROM documents
         ORDER BY upload_time DESC, id DESC
     """
@@ -72,11 +73,70 @@ def get_document_by_id(doc_id: int, db_path: Optional[str] = None) -> Optional[s
     cursor = conn.cursor()
 
     query = """
-        SELECT id, filename, original_filename, upload_time, page_count, character_count, status
+        SELECT id, filename, original_filename, upload_time, page_count, character_count, status, content_hash
         FROM documents
         WHERE id = ?
     """
     cursor.execute(query, (doc_id,))
+    row = cursor.fetchone()
+
+    if db_path is not None:
+        conn.close()
+
+    return row
+
+
+def get_document_by_content_hash(
+    content_hash: str,
+    db_path: Optional[str] = None
+) -> Optional[sqlite3.Row]:
+    """
+    Retrieves an existing processed document matching a content hash (SHA-256).
+    Returns the most recent matching record, or None if no match.
+    """
+    if not content_hash:
+        return None
+
+    conn = get_db(db_path)
+    cursor = conn.cursor()
+
+    query = """
+        SELECT id, filename, original_filename, upload_time, page_count, character_count, status, content_hash
+        FROM documents
+        WHERE content_hash = ? AND status = 'processed'
+        ORDER BY id DESC
+        LIMIT 1
+    """
+    cursor.execute(query, (content_hash,))
+    row = cursor.fetchone()
+
+    if db_path is not None:
+        conn.close()
+
+    return row
+
+
+def get_document_by_filename(
+    filename: str,
+    db_path: Optional[str] = None
+) -> Optional[sqlite3.Row]:
+    """
+    Retrieves a single document record by its stored filename.
+    """
+    if not filename:
+        return None
+
+    conn = get_db(db_path)
+    cursor = conn.cursor()
+
+    query = """
+        SELECT id, filename, original_filename, upload_time, page_count, character_count, status, content_hash
+        FROM documents
+        WHERE filename = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """
+    cursor.execute(query, (filename,))
     row = cursor.fetchone()
 
     if db_path is not None:

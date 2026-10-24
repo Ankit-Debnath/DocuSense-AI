@@ -4,10 +4,12 @@ Handles PDF upload, history viewing, API key management, cached summarization, a
 Features SQLite summary caching and structured performance timing logs.
 """
 
+import hashlib
 import logging
 import os
 import sys
 import time
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, jsonify, session
 
@@ -16,6 +18,9 @@ from pdf_processing.extractor import extract_text_from_pdf
 from database.models import (
     insert_document,
     get_all_documents,
+    get_document_by_id,
+    get_document_by_content_hash,
+    get_document_by_filename,
     save_document_summary,
     get_document_summary,
     delete_document_summary,
@@ -36,6 +41,9 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 pdf_bp = Blueprint("pdf", __name__)
+
+# Maximum number of Q&A conversational turns retained in client-side session cookie
+MAX_QA_HISTORY_TURNS = 5
 
 
 def is_safe_redirect_url(target: str) -> bool:
@@ -136,10 +144,11 @@ def upload_pdf():
     Handles PDF file uploads:
     - Verifies 'pdf_file' exists in request.files
     - Validates file extension and PDF signature
-    - Saves the file safely with a sanitized, collision-free filename
+    - Computes SHA-256 content hash and checks for duplicate uploads
+    - Reuses existing stored document, summary, and page explanations if hash matches and file is valid
+    - Otherwise saves the file safely with a sanitized, collision-free filename
     - Extracts text page-by-page using pypdf (with latency measurement)
-    - Saves document metadata to SQLite
-    - Checks for existing cached summary
+    - Saves document metadata and content hash to SQLite
     - Renders the results page or flashes errors
     """
     upload_t0 = time.perf_counter()
@@ -161,12 +170,69 @@ def upload_pdf():
         flash(error_message, "error")
         return redirect(url_for("pdf.index"))
 
-    # Generate a collision-free and safe filename
-    safe_filename = generate_safe_filename(file.filename)
-    upload_folder = current_app.config["UPLOAD_FOLDER"]
+    # Compute SHA-256 hash of the uploaded PDF content
+    hasher = hashlib.sha256()
+    while chunk := file.stream.read(65536):
+        hasher.update(chunk)
+    content_hash = hasher.hexdigest()
+    # Rewind stream immediately for any subsequent operations
+    file.stream.seek(0)
 
-    # Ensure uploads directory exists
+    upload_folder = current_app.config["UPLOAD_FOLDER"]
     os.makedirs(upload_folder, exist_ok=True)
+
+    # Check for existing stored document with matching content hash
+    existing_doc = get_document_by_content_hash(content_hash)
+    if existing_doc:
+        is_safe, existing_path = _validate_stored_filename(existing_doc["filename"], upload_folder)
+        if is_safe and os.path.isfile(existing_path):
+            extract_t0 = time.perf_counter()
+            extraction_result = extract_text_from_pdf(existing_path)
+            extract_ms = (time.perf_counter() - extract_t0) * 1000
+
+            if extraction_result["success"]:
+                safe_filename = existing_doc["filename"]
+                total_upload_ms = (time.perf_counter() - upload_t0) * 1000
+                logger.info(
+                    "[PERF] Duplicate Upload CACHE HIT | File: %s | Reused: %s | Hash: %s | Extraction: %.2f ms | Total: %.2f ms",
+                    file.filename,
+                    safe_filename,
+                    content_hash,
+                    extract_ms,
+                    total_upload_ms
+                )
+
+                # Check if summary is already cached
+                cached_row = get_document_summary(safe_filename)
+                cached_summary_result = None
+                if cached_row:
+                    cached_summary_result = {
+                        "success": True,
+                        "summary": cached_row["summary"],
+                        "error": None,
+                        "model_used": cached_row["model_used"],
+                        "cached": True
+                    }
+
+                # Clear previous Q&A session history for newly uploaded file
+                session.pop(f"qa_history_{safe_filename}", None)
+
+                # Render results page with page-by-page extracted content and cached AI controls
+                enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], safe_filename)
+                return render_template(
+                    "result.html",
+                    filename=existing_doc["original_filename"],
+                    stored_filename=safe_filename,
+                    total_pages=extraction_result["total_pages"],
+                    total_characters=extraction_result["total_characters"],
+                    has_extractable_text=extraction_result["has_extractable_text"],
+                    pages=enriched_pages,
+                    summary_result=cached_summary_result,
+                    qa_history=[]
+                )
+
+    # Cache miss or missing stored file: generate a collision-free and safe filename
+    safe_filename = generate_safe_filename(file.filename)
 
     # Save the file to the dedicated uploads folder
     destination_path = os.path.join(upload_folder, safe_filename)
@@ -179,24 +245,31 @@ def upload_pdf():
 
     # Handle extraction errors (e.g., password-protected or corrupted PDFs)
     if not extraction_result["success"]:
+        if os.path.exists(destination_path):
+            try:
+                os.remove(destination_path)
+            except OSError:
+                pass
         flash(extraction_result["error"] or "Failed to extract text from the PDF.", "error")
         return redirect(url_for("pdf.index"))
 
-    # Persist document metadata in the SQLite database
+    # Persist document metadata and content hash in the SQLite database
     insert_document(
         filename=safe_filename,
         original_filename=file.filename,
         page_count=extraction_result["total_pages"],
         character_count=extraction_result["total_characters"],
-        status="processed"
+        status="processed",
+        content_hash=content_hash
     )
 
     total_upload_ms = (time.perf_counter() - upload_t0) * 1000
     logger.info(
-        "[PERF] Upload & Extraction Complete | Filename: %s | Pages: %d | Chars: %d | Extraction: %.2f ms | Total Upload: %.2f ms",
+        "[PERF] Upload & Extraction Complete | Filename: %s | Pages: %d | Chars: %d | Hash: %s | Extraction: %.2f ms | Total Upload: %.2f ms",
         safe_filename,
         extraction_result["total_pages"],
         extraction_result["total_characters"],
+        content_hash,
         extract_ms,
         total_upload_ms
     )
@@ -238,6 +311,71 @@ def history():
     """
     documents = get_all_documents()
     return render_template("history.html", documents=documents)
+
+
+@pdf_bp.route("/history/<int:doc_id>", methods=["GET"])
+@pdf_bp.route("/analysis/<path:stored_filename>", methods=["GET"])
+@pdf_bp.route("/analysis/<int:doc_id>", methods=["GET"])
+def view_analysis(doc_id: Optional[int] = None, stored_filename: Optional[str] = None):
+    """
+    Renders the complete extraction and analysis results for an existing document from history.
+    Validates document record in database and file on disk to prevent path traversal or missing data errors.
+    """
+    if doc_id is not None:
+        doc = get_document_by_id(doc_id)
+    elif stored_filename:
+        if stored_filename.isdigit():
+            doc = get_document_by_id(int(stored_filename))
+        else:
+            doc = None
+        if not doc:
+            doc = get_document_by_filename(stored_filename)
+    else:
+        doc = None
+
+    if not doc:
+        flash("Document record not found in history.", "error")
+        return redirect(url_for("pdf.history"))
+
+    upload_folder = current_app.config["UPLOAD_FOLDER"]
+    is_valid, file_path = _validate_stored_filename(doc["filename"], upload_folder)
+    if not is_valid:
+        flash("Document file not found on disk or invalid filename.", "error")
+        return redirect(url_for("pdf.history"))
+
+    extract_t0 = time.perf_counter()
+    extraction_result = extract_text_from_pdf(file_path)
+    extract_ms = (time.perf_counter() - extract_t0) * 1000
+
+    if not extraction_result["success"]:
+        flash(extraction_result["error"] or "Failed to read document.", "error")
+        return redirect(url_for("pdf.history"))
+
+    cached_row = get_document_summary(doc["filename"])
+    cached_summary_result = None
+    if cached_row:
+        cached_summary_result = {
+            "success": True,
+            "summary": cached_row["summary"],
+            "error": None,
+            "model_used": cached_row["model_used"],
+            "cached": True
+        }
+
+    qa_history = session.get(f"qa_history_{doc['filename']}", [])
+    enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], doc["filename"])
+
+    return render_template(
+        "result.html",
+        filename=doc["original_filename"],
+        stored_filename=doc["filename"],
+        total_pages=extraction_result["total_pages"],
+        total_characters=extraction_result["total_characters"],
+        has_extractable_text=extraction_result["has_extractable_text"],
+        pages=enriched_pages,
+        summary_result=cached_summary_result,
+        qa_history=qa_history
+    )
 
 
 @pdf_bp.route("/save-key", methods=["POST"])
@@ -393,6 +531,10 @@ def ask():
         qa_history = []
         qa_result = None
         question = ""
+        if request.is_json:
+            return jsonify({"success": True, "cleared": True})
+        extract_t0 = time.perf_counter()
+        extraction_result = extract_text_from_pdf(file_path)
     else:
         if not question:
             flash("Please enter a question about the document.", "error")
@@ -415,17 +557,16 @@ def ask():
         qa_history = session.get(history_key, [])
         if qa_result.get("success"):
             qa_history.append({
-                "question": question,
-                "answer": qa_result.get("answer", ""),
-                "page_citations": qa_result.get("page_citations", []),
-                "evidence_passages": qa_result.get("evidence_passages", []),
+                "question": question[:300],
+                "answer": qa_result.get("answer", "")[:1500],
+                "page_citations": qa_result.get("page_citations", [])[:10],
                 "model_used": qa_result.get("model_used", ""),
                 "success": True
             })
+            # Bound history entries to maintain safe client-side cookie limits
+            if len(qa_history) > MAX_QA_HISTORY_TURNS:
+                qa_history = qa_history[-MAX_QA_HISTORY_TURNS:]
             session[history_key] = qa_history
-
-    extract_t0 = time.perf_counter()
-    extraction_result = extract_text_from_pdf(file_path)
 
     # Also pass existing cached summary if available
     cached_row = get_document_summary(stored_filename)
