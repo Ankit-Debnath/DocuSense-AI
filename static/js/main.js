@@ -89,9 +89,9 @@ function formatMarkdownToSafeHtml(rawMarkdown) {
         rawHtml = rawHtml.replace(item.id, item.math);
     }
 
-    // D. Enhance Page Citations [Page X] or [Pages X–Y] into interactive jump pills
-    rawHtml = rawHtml.replace(/\[Page\s+(\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Page $1">Page $1</button>');
-    rawHtml = rawHtml.replace(/\[Pages\s+(\d+)[–-](\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Pages $1–$2">Pages $1–$2</button>');
+    // D. Enhance Page Citations [Page X], [Pages X–Y], [Pages X-Y] into interactive jump pills
+    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\s*[–-]\s*(\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Pages $1–$2">Pages $1–$2</button>');
+    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Page $1">Page $1</button>');
 
     // E. Sanitize with DOMPurify to guarantee XSS prevention
     const cleanHtml = DOMPurify.sanitize(rawHtml, {
@@ -184,7 +184,7 @@ function renderMarkdownSummary() {
     formattedContainer.setAttribute("data-rendered", "true");
 
     applyMathRendering(formattedContainer);
-    enhanceExecutiveOverview(formattedContainer);
+    enhanceDocumentSections(formattedContainer);
     bindCitationPills();
 }
 
@@ -210,6 +210,7 @@ function renderMarkdownQAAnswers() {
         container.setAttribute("data-rendered", "true");
 
         applyMathRendering(formattedElement);
+        enhanceQADirectAnswers(formattedElement);
     });
 
     bindCitationPills();
@@ -221,16 +222,248 @@ function renderMarkdownQAAnswers() {
 function renderAllContent() {
     renderMarkdownSummary();
     renderMarkdownQAAnswers();
+    renderPageExplanations();
 }
 
 /**
- * Packages the Executive Overview section into a distinct callout card.
+ * Renders all AI page walkthrough explanations present in the DOM.
+ */
+function renderPageExplanations() {
+    document.querySelectorAll(".page-explanation-content").forEach(container => {
+        if (container.getAttribute("data-rendered") === "true" && typeof marked !== "undefined") {
+            return;
+        }
+
+        const rawElement = container.querySelector(".page-explanation-raw");
+        if (!rawElement) return;
+
+        const rawText = (rawElement.textContent || "").trim();
+        if (!rawText) return;
+
+        const cleanHtml = formatMarkdownToSafeHtml(rawText);
+        container.innerHTML = cleanHtml;
+        container.setAttribute("data-rendered", "true");
+
+        applyMathRendering(container);
+        enhanceDocumentSections(container);
+        bindCitationPills();
+
+        // Update page heading title if a descriptive title exists in explanation
+        const h1 = container.querySelector("h1, h2");
+        if (h1) {
+            const pageIdMatch = container.id.match(/page-explanation-text-(\d+)/);
+            if (pageIdMatch) {
+                const pageNum = pageIdMatch[1];
+                const headingEl = document.getElementById(`page-heading-${pageNum}`);
+                if (headingEl) {
+                    const cleanTitle = h1.textContent.trim();
+                    if (cleanTitle) {
+                        headingEl.textContent = cleanTitle;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/**
+ * Attaches click handlers for on-demand "Explain Page", "Regenerate", and retry actions.
+ */
+function bindPageExplanationActions() {
+    document.querySelectorAll(".btn-explain-page, .btn-refresh-explanation, .btn-retry-explanation").forEach(btn => {
+        if (btn.getAttribute("data-bound") === "true") return;
+        btn.setAttribute("data-bound", "true");
+
+        btn.addEventListener("click", async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const pageNum = btn.getAttribute("data-page");
+            const storedFilename = btn.getAttribute("data-stored");
+            const originalFilename = btn.getAttribute("data-original") || storedFilename;
+            const isRegenerate = btn.classList.contains("btn-refresh-explanation") || btn.textContent.toLowerCase().includes("regenerate");
+
+            if (!pageNum || !storedFilename) return;
+
+            const accordion = document.getElementById(`page-item-${pageNum}`);
+            if (accordion) accordion.open = true;
+
+            const wrap = document.getElementById(`page-explanation-wrap-${pageNum}`);
+            const textContainer = document.getElementById(`page-explanation-text-${pageNum}`);
+            const loading = document.getElementById(`page-loading-${pageNum}`);
+            const badge = document.getElementById(`page-badge-${pageNum}`);
+            const unexplained = document.getElementById(`page-unexplained-${pageNum}`);
+            const errorBox = document.getElementById(`page-error-${pageNum}`);
+
+            if (errorBox) errorBox.style.display = "none";
+            if (loading) loading.style.display = "flex";
+            if (wrap && isRegenerate) wrap.style.opacity = "0.5";
+            btn.disabled = true;
+
+            try {
+                const csrfInput = document.querySelector('input[name="csrf_token"]');
+                const csrfToken = csrfInput ? csrfInput.value : getCSRFToken();
+
+                const formData = new FormData();
+                formData.append("csrf_token", csrfToken);
+                formData.append("stored_filename", storedFilename);
+                formData.append("original_filename", originalFilename);
+                formData.append("page_number", pageNum);
+                if (isRegenerate) {
+                    formData.append("regenerate", "true");
+                }
+
+                const response = await fetch("/explain-page", {
+                    method: "POST",
+                    body: formData,
+                    headers: {
+                        "X-Requested-With": "XMLHttpRequest"
+                    }
+                });
+
+                const data = await response.json();
+
+                if (data.success && data.explanation) {
+                    if (textContainer) {
+                        const cleanHtml = formatMarkdownToSafeHtml(data.explanation);
+                        textContainer.innerHTML = cleanHtml;
+                        textContainer.setAttribute("data-rendered", "true");
+
+                        applyMathRendering(textContainer);
+                        enhanceDocumentSections(textContainer);
+                        bindCitationPills();
+
+                        const h1 = textContainer.querySelector("h1, h2");
+                        const headingEl = document.getElementById(`page-heading-${pageNum}`);
+                        if (h1 && headingEl) {
+                            headingEl.textContent = h1.textContent.trim();
+                        }
+                    }
+
+                    if (wrap) {
+                        wrap.style.display = "block";
+                        wrap.style.opacity = "1";
+                    }
+
+                    if (unexplained) {
+                        unexplained.style.display = "none";
+                    }
+
+                    if (errorBox) {
+                        errorBox.style.display = "none";
+                    }
+
+                    if (badge) {
+                        badge.style.display = "inline-flex";
+                    }
+
+                    // Update action buttons for this page
+                    if (accordion) {
+                        accordion.querySelectorAll(".btn-explain-page").forEach(b => {
+                            b.textContent = "Regenerate Explanation";
+                        });
+                    }
+                } else {
+                    const errMsg = data.error || "Failed to generate explanation for this page.";
+                    if (errorBox) {
+                        const msgEl = errorBox.querySelector(".error-msg");
+                        if (msgEl) msgEl.textContent = errMsg;
+                        errorBox.style.display = "flex";
+                        bindPageExplanationActions();
+                    } else {
+                        alert(errMsg);
+                    }
+                }
+            } catch (err) {
+                console.error("Page explanation request failed:", err);
+                const errMsg = "An error occurred while communicating with the server. Please check your connection.";
+                if (errorBox) {
+                    const msgEl = errorBox.querySelector(".error-msg");
+                    if (msgEl) msgEl.textContent = errMsg;
+                    errorBox.style.display = "flex";
+                    bindPageExplanationActions();
+                } else {
+                    alert(errMsg);
+                }
+            } finally {
+                if (loading) loading.style.display = "none";
+                if (wrap) wrap.style.opacity = "1";
+                btn.disabled = false;
+            }
+        });
+    });
+}
+
+/**
+ * Collects immediate sibling elements following a heading until the next heading of equal or higher level.
+ */
+function collectSectionSiblings(heading, stopLevels) {
+    const levels = stopLevels || ["H1", "H2"];
+    const siblings = [];
+    let next = heading.nextElementSibling;
+    while (next && !levels.includes(next.tagName.toUpperCase())) {
+        siblings.push(next);
+        next = next.nextElementSibling;
+    }
+    return siblings;
+}
+
+/**
+ * Transforms Document Information lists into clean, structured metadata grids.
+ */
+function enhanceDocumentInformation(container) {
+    const headings = container.querySelectorAll("h1, h2, h3, h4");
+    headings.forEach(heading => {
+        const text = heading.textContent.toLowerCase();
+        if ((text.includes("document information") || text.includes("document metadata")) && !heading.closest(".document-meta-card")) {
+            heading.classList.add("document-info-heading");
+            const siblings = collectSectionSiblings(heading, ["H1", "H2"]);
+            const list = siblings.find(el => el.tagName === "UL" || el.tagName === "OL");
+            if (list) {
+                const metaGrid = document.createElement("div");
+                metaGrid.className = "document-meta-card";
+
+                let hasChips = false;
+                list.querySelectorAll("li").forEach(li => {
+                    const strong = li.querySelector("strong, b");
+                    if (strong) {
+                        const rawLabel = strong.textContent.replace(/:$/, "").trim();
+                        const valText = li.textContent.replace(strong.textContent, "").trim().replace(/^:\s*/, "");
+
+                        const chip = document.createElement("div");
+                        chip.className = "meta-chip";
+
+                        const labelEl = document.createElement("span");
+                        labelEl.className = "meta-chip-label";
+                        labelEl.textContent = rawLabel;
+
+                        const valEl = document.createElement("span");
+                        valEl.className = "meta-chip-value";
+                        valEl.textContent = valText || "—";
+
+                        chip.appendChild(labelEl);
+                        chip.appendChild(valEl);
+                        metaGrid.appendChild(chip);
+                        hasChips = true;
+                    }
+                });
+
+                if (hasChips) {
+                    list.parentNode.replaceChild(metaGrid, list);
+                }
+            }
+        }
+    });
+}
+
+/**
+ * Packages the Executive Overview or Page Overview section into a distinct callout card.
  */
 function enhanceExecutiveOverview(container) {
     const headings = container.querySelectorAll("h1, h2, h3, h4");
     headings.forEach(heading => {
         const text = heading.textContent.toLowerCase();
-        if (text.includes("executive overview") || text.includes("executive summary")) {
+        if ((text.includes("executive overview") || text.includes("executive summary") || text.includes("page overview") || text === "overview") && !heading.closest(".executive-overview-callout")) {
             heading.classList.add("executive-overview-heading");
             const callout = document.createElement("div");
             callout.className = "executive-overview-callout";
@@ -240,13 +473,128 @@ function enhanceExecutiveOverview(container) {
 
             while (callout.nextSibling) {
                 const sibling = callout.nextSibling;
-                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-6]$/i.test(sibling.tagName)) {
+                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-2]$/i.test(sibling.tagName)) {
                     break;
                 }
                 callout.appendChild(sibling);
             }
         }
     });
+}
+
+/**
+ * Packages Key Takeaways sections into an accented callout card.
+ */
+function enhanceKeyTakeaways(container) {
+    const headings = container.querySelectorAll("h1, h2, h3, h4");
+    headings.forEach(heading => {
+        const text = heading.textContent.toLowerCase();
+        if ((text.includes("key takeaways") || text.includes("key findings")) && !heading.closest(".takeaways-callout")) {
+            heading.classList.add("takeaways-heading");
+            const callout = document.createElement("div");
+            callout.className = "takeaways-callout";
+
+            heading.parentNode.insertBefore(callout, heading);
+            callout.appendChild(heading);
+
+            while (callout.nextSibling) {
+                const sibling = callout.nextSibling;
+                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-2]$/i.test(sibling.tagName)) {
+                    break;
+                }
+                callout.appendChild(sibling);
+            }
+        }
+    });
+}
+
+/**
+ * Packages Limitations & Considerations into an alert/callout box.
+ */
+function enhanceLimitations(container) {
+    const headings = container.querySelectorAll("h1, h2, h3, h4");
+    headings.forEach(heading => {
+        const text = heading.textContent.toLowerCase();
+        if (text.includes("limitations") && !heading.closest(".limitations-callout")) {
+            heading.classList.add("limitations-heading");
+            const callout = document.createElement("div");
+            callout.className = "limitations-callout";
+
+            heading.parentNode.insertBefore(callout, heading);
+            callout.appendChild(heading);
+
+            while (callout.nextSibling) {
+                const sibling = callout.nextSibling;
+                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-2]$/i.test(sibling.tagName)) {
+                    break;
+                }
+                callout.appendChild(sibling);
+            }
+        }
+    });
+}
+
+/**
+ * Packages Conclusion & Implications into a distinctive callout card.
+ */
+function enhanceConclusion(container) {
+    const headings = container.querySelectorAll("h1, h2, h3, h4");
+    headings.forEach(heading => {
+        const text = heading.textContent.toLowerCase();
+        if ((text.includes("conclusion") || text.includes("strategic implications")) && !heading.closest(".conclusion-callout")) {
+            heading.classList.add("conclusion-heading");
+            const callout = document.createElement("div");
+            callout.className = "conclusion-callout";
+
+            heading.parentNode.insertBefore(callout, heading);
+            callout.appendChild(heading);
+
+            while (callout.nextSibling) {
+                const sibling = callout.nextSibling;
+                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-2]$/i.test(sibling.tagName)) {
+                    break;
+                }
+                callout.appendChild(sibling);
+            }
+        }
+    });
+}
+
+/**
+ * Packages Q&A Direct Answer sections into a prominent highlight card.
+ */
+function enhanceQADirectAnswers(container) {
+    const headings = container.querySelectorAll("h1, h2, h3, h4");
+    headings.forEach(heading => {
+        const text = heading.textContent.toLowerCase();
+        if (text.includes("direct answer") && !heading.closest(".qa-direct-answer-callout")) {
+            heading.classList.add("qa-direct-answer-heading");
+            const callout = document.createElement("div");
+            callout.className = "qa-direct-answer-callout";
+
+            heading.parentNode.insertBefore(callout, heading);
+            callout.appendChild(heading);
+
+            while (callout.nextSibling) {
+                const sibling = callout.nextSibling;
+                if (sibling.nodeType === Node.ELEMENT_NODE && /^H[1-4]$/i.test(sibling.tagName)) {
+                    break;
+                }
+                callout.appendChild(sibling);
+            }
+        }
+    });
+}
+
+/**
+ * Master enhancer for all document summary semantic report sections.
+ */
+function enhanceDocumentSections(container) {
+    enhanceDocumentInformation(container);
+    enhanceExecutiveOverview(container);
+    enhanceKeyTakeaways(container);
+    enhanceLimitations(container);
+    enhanceConclusion(container);
 }
 
 /**
@@ -277,8 +625,9 @@ function wrapFallbackMath(container) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    // 1. Initial Markdown and LaTeX rendering on DOM ready
+    // 1. Initial Markdown, LaTeX, and page walkthrough rendering on DOM ready
     renderAllContent();
+    bindPageExplanationActions();
 
     // 2. Re-render once external CDN scripts (Marked, KaTeX) finish loading
     window.addEventListener("load", () => {

@@ -171,3 +171,127 @@ def delete_document_summary(
     finally:
         if db_path is not None and conn is not None:
             conn.close()
+
+
+def save_page_explanation(
+    filename: str,
+    page_number: int,
+    explanation: str,
+    model_used: str,
+    db_path: Optional[str] = None
+) -> bool:
+    """
+    Saves or updates a structured technical explanation for a specific page in SQLite.
+    Gracefully catches and logs errors so database issues never crash the app.
+    """
+    conn = None
+    try:
+        conn = get_db(db_path)
+        cursor = conn.cursor()
+
+        query = """
+            INSERT INTO page_explanations (filename, page_number, explanation, model_used, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(filename, page_number) DO UPDATE SET
+                explanation = excluded.explanation,
+                model_used = excluded.model_used,
+                created_at = CURRENT_TIMESTAMP
+        """
+        cursor.execute(query, (filename, page_number, explanation, model_used))
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning("Failed to save page explanation for '%s' p%d: %s", filename, page_number, exc)
+        return False
+    finally:
+        if db_path is not None and conn is not None:
+            conn.close()
+
+
+def get_page_explanation(
+    filename: str,
+    page_number: int,
+    db_path: Optional[str] = None
+) -> Optional[sqlite3.Row]:
+    """
+    Retrieves a cached page explanation from SQLite for a specific document and page.
+    """
+    conn = None
+    try:
+        conn = get_db(db_path)
+        cursor = conn.cursor()
+
+        query = """
+            SELECT filename, page_number, explanation, model_used, created_at
+            FROM page_explanations
+            WHERE filename = ? AND page_number = ?
+        """
+        cursor.execute(query, (filename, page_number))
+        return cursor.fetchone()
+    except Exception as exc:
+        logger.warning("Failed to get page explanation for '%s' p%d: %s", filename, page_number, exc)
+        return None
+    finally:
+        if db_path is not None and conn is not None:
+            conn.close()
+
+
+def get_document_page_explanations(
+    filename: str,
+    db_path: Optional[str] = None
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Retrieves all cached page explanations for a document as a dict keyed by page_number.
+    """
+    conn = None
+    try:
+        conn = get_db(db_path)
+        cursor = conn.cursor()
+
+        query = """
+            SELECT page_number, explanation, model_used, created_at
+            FROM page_explanations
+            WHERE filename = ?
+            ORDER BY page_number ASC
+        """
+        cursor.execute(query, (filename,))
+        rows = cursor.fetchall()
+        result: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            result[row["page_number"]] = {
+                "explanation": row["explanation"],
+                "model_used": row["model_used"],
+                "created_at": row["created_at"]
+            }
+        return result
+    except Exception as exc:
+        logger.warning("Failed to get all page explanations for '%s': %s", filename, exc)
+        return {}
+    finally:
+        if db_path is not None and conn is not None:
+            conn.close()
+
+
+def delete_page_explanation(
+    filename: str,
+    page_number: int,
+    db_path: Optional[str] = None
+) -> bool:
+    """
+    Deletes a specific page explanation cache entry.
+    """
+    conn = None
+    try:
+        conn = get_db(db_path)
+        cursor = conn.cursor()
+
+        query = "DELETE FROM page_explanations WHERE filename = ? AND page_number = ?"
+        cursor.execute(query, (filename, page_number))
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning("Failed to delete page explanation for '%s' p%d: %s", filename, page_number, exc)
+        return False
+    finally:
+        if db_path is not None and conn is not None:
+            conn.close()

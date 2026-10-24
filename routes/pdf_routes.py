@@ -18,9 +18,13 @@ from database.models import (
     get_all_documents,
     save_document_summary,
     get_document_summary,
-    delete_document_summary
+    delete_document_summary,
+    save_page_explanation,
+    get_page_explanation,
+    get_document_page_explanations,
+    delete_page_explanation
 )
-from ai.analyzer import summarize_document, answer_pdf_question
+from ai.analyzer import summarize_document, answer_pdf_question, explain_page_content
 from ai.llm_client import save_api_key
 
 # Structured route performance logger
@@ -104,6 +108,18 @@ def _validate_stored_filename(stored_filename: str, upload_folder: str) -> tuple
         return False, ""
 
     return True, resolved_path
+
+
+def _enrich_pages_with_explanations(pages: List[Dict[str, Any]], stored_filename: str) -> List[Dict[str, Any]]:
+    """
+    Enriches page dictionaries with cached AI walkthrough explanations from SQLite.
+    """
+    cached_map = get_document_page_explanations(stored_filename)
+    for p in pages:
+        cached = cached_map.get(p["page_number"])
+        p["explanation"] = cached["explanation"] if cached else None
+        p["explanation_model"] = cached["model_used"] if cached else None
+    return pages
 
 
 @pdf_bp.route("/", methods=["GET"])
@@ -201,6 +217,7 @@ def upload_pdf():
     session.pop(f"qa_history_{safe_filename}", None)
 
     # Render results page with page-by-page extracted content and AI controls
+    enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], safe_filename)
     return render_template(
         "result.html",
         filename=file.filename,
@@ -208,7 +225,7 @@ def upload_pdf():
         total_pages=extraction_result["total_pages"],
         total_characters=extraction_result["total_characters"],
         has_extractable_text=extraction_result["has_extractable_text"],
-        pages=extraction_result["pages"],
+        pages=enriched_pages,
         summary_result=cached_summary_result,
         qa_history=[]
     )
@@ -288,6 +305,7 @@ def summarize():
             return jsonify(summary_result)
 
         qa_history = session.get(f"qa_history_{stored_filename}", [])
+        enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], stored_filename)
         return render_template(
             "result.html",
             filename=original_filename,
@@ -295,7 +313,7 @@ def summarize():
             total_pages=extraction_result["total_pages"],
             total_characters=extraction_result["total_characters"],
             has_extractable_text=extraction_result["has_extractable_text"],
-            pages=extraction_result["pages"],
+            pages=enriched_pages,
             summary_result=summary_result,
             qa_history=qa_history
         )
@@ -308,7 +326,11 @@ def summarize():
     extraction_result = extract_text_from_pdf(file_path)
     extract_ms = (time.perf_counter() - extract_t0) * 1000
 
-    summary_result = summarize_document(extraction_result["pages"])
+    summary_result = summarize_document(
+        extraction_result["pages"],
+        document_title=original_filename,
+        total_pages=extraction_result["total_pages"]
+    )
     summary_result["cached"] = False
 
     # 3. Cache successful summary in SQLite
@@ -332,6 +354,7 @@ def summarize():
         return jsonify(summary_result)
 
     qa_history = session.get(f"qa_history_{stored_filename}", [])
+    enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], stored_filename)
     return render_template(
         "result.html",
         filename=original_filename,
@@ -339,7 +362,7 @@ def summarize():
         total_pages=extraction_result["total_pages"],
         total_characters=extraction_result["total_characters"],
         has_extractable_text=extraction_result["has_extractable_text"],
-        pages=extraction_result["pages"],
+        pages=enriched_pages,
         summary_result=summary_result,
         qa_history=qa_history
     )
@@ -418,6 +441,7 @@ def ask():
     if request.is_json:
         return jsonify(qa_result if qa_result else {"success": True, "cleared": True})
 
+    enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], stored_filename)
     return render_template(
         "result.html",
         filename=original_filename,
@@ -425,9 +449,98 @@ def ask():
         total_pages=extraction_result["total_pages"],
         total_characters=extraction_result["total_characters"],
         has_extractable_text=extraction_result["has_extractable_text"],
-        pages=extraction_result["pages"],
+        pages=enriched_pages,
         summary_result=summary_result,
         qa_result=qa_result,
         qa_history=qa_history,
         last_question=question
     )
+
+
+@pdf_bp.route("/explain-page", methods=["POST"])
+def explain_page():
+    """
+    Generates and caches a publication-grade walkthrough of an individual PDF page.
+    Returns JSON response with the structured explanation and cache status.
+    """
+    explain_t0 = time.perf_counter()
+
+    # Support both Form submission and JSON payload
+    data = request.get_json(silent=True) or request.form
+
+    stored_filename = (data.get("stored_filename") or "").strip()
+    original_filename = (data.get("original_filename") or stored_filename).strip()
+    page_num_str = str(data.get("page_number", "")).strip()
+    regenerate = str(data.get("regenerate", "")).strip().lower() in ("true", "1")
+
+    if not page_num_str.isdigit():
+        return jsonify({"success": False, "error": "Invalid or missing page number."}), 400
+
+    page_number = int(page_num_str)
+
+    is_valid, file_path = _validate_stored_filename(stored_filename, current_app.config["UPLOAD_FOLDER"])
+    if not is_valid:
+        return jsonify({"success": False, "error": "Invalid document reference or file not found."}), 404
+
+    # 1. Check SQLite cache unless force-regenerating
+    cached = get_page_explanation(stored_filename, page_number) if not regenerate else None
+    if cached:
+        total_ms = (time.perf_counter() - explain_t0) * 1000
+        logger.info(
+            "[PERF] Page Explain CACHE HIT | File: %s | Page: %d | Latency: %.2f ms",
+            stored_filename,
+            page_number,
+            total_ms
+        )
+        return jsonify({
+            "success": True,
+            "page_number": page_number,
+            "explanation": cached["explanation"],
+            "model_used": cached["model_used"],
+            "cached": True,
+            "timing_ms": {"api_ms": 0.0, "total_ms": total_ms}
+        })
+
+    # 2. Extract text from PDF file
+    extraction_result = extract_text_from_pdf(file_path)
+    if not extraction_result["success"]:
+        return jsonify({"success": False, "error": extraction_result["error"] or "Failed to read PDF."}), 500
+
+    target_page = next((p for p in extraction_result["pages"] if p["page_number"] == page_number), None)
+    if not target_page:
+        return jsonify({"success": False, "error": f"Page {page_number} not found in document."}), 404
+
+    if regenerate:
+        delete_page_explanation(stored_filename, page_number)
+
+    # 3. Generate structured explanation with Gemini
+    result = explain_page_content(
+        page_number=page_number,
+        page_text=target_page["text"],
+        total_pages=extraction_result["total_pages"],
+        document_title=original_filename
+    )
+
+    # 4. Cache successful explanation in SQLite
+    if result["success"]:
+        save_page_explanation(
+            filename=stored_filename,
+            page_number=page_number,
+            explanation=result["explanation"],
+            model_used=result["model_used"]
+        )
+
+    total_ms = (time.perf_counter() - explain_t0) * 1000
+    result["cached"] = False
+    if "timing_ms" in result:
+        result["timing_ms"]["total_ms"] = total_ms
+
+    logger.info(
+        "[PERF] Page Explain Complete | File: %s | Page: %d | Success: %s | Total: %.2f ms",
+        stored_filename,
+        page_number,
+        result["success"],
+        total_ms
+    )
+
+    return jsonify(result)

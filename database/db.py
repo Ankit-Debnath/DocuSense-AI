@@ -73,6 +73,18 @@ def init_db(db_path=None):
         );
     """)
 
+    # Create page_explanations cache table for page-by-page technical walkthroughs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS page_explanations (
+            filename TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            explanation TEXT NOT NULL,
+            model_used TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (filename, page_number)
+        );
+    """)
+
     conn.commit()
     conn.close()
 

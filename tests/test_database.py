@@ -15,7 +15,11 @@ from database.models import (
     get_document_by_id,
     save_document_summary,
     get_document_summary,
-    delete_document_summary
+    delete_document_summary,
+    save_page_explanation,
+    get_page_explanation,
+    get_document_page_explanations,
+    delete_page_explanation
 )
 
 
@@ -174,6 +178,49 @@ class DatabaseTestCase(unittest.TestCase):
             # 4. Delete summary
             delete_document_summary("cached_doc.pdf")
             self.assertIsNone(get_document_summary("cached_doc.pdf"))
+
+    def test_page_explanation_cache_operations(self):
+        """Test creating, reading, querying all, updating, and deleting page-by-page technical walkthroughs."""
+        with self.app.app_context():
+            # 1. Retrieve non-existent page explanation
+            self.assertIsNone(get_page_explanation("doc.pdf", 1))
+            self.assertEqual(get_document_page_explanations("doc.pdf"), {})
+
+            # 2. Save page explanation
+            success = save_page_explanation(
+                filename="doc.pdf",
+                page_number=1,
+                explanation="# Page 1 — Abstract\nDetailed walkthrough.",
+                model_used="gemini-flash-lite-latest"
+            )
+            self.assertTrue(success)
+
+            # 3. Retrieve single page
+            row = get_page_explanation("doc.pdf", 1)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["filename"], "doc.pdf")
+            self.assertEqual(row["page_number"], 1)
+            self.assertIn("Detailed walkthrough", row["explanation"])
+            self.assertEqual(row["model_used"], "gemini-flash-lite-latest")
+
+            # 4. Save second page and retrieve all
+            save_page_explanation("doc.pdf", 2, "# Page 2 — Introduction", "gemini-flash-lite-latest")
+            all_pages = get_document_page_explanations("doc.pdf")
+            self.assertEqual(len(all_pages), 2)
+            self.assertIn(1, all_pages)
+            self.assertIn(2, all_pages)
+            self.assertIn("Abstract", all_pages[1]["explanation"])
+            self.assertIn("Introduction", all_pages[2]["explanation"])
+
+            # 5. Update page explanation (upsert on conflict)
+            save_page_explanation("doc.pdf", 1, "# Page 1 — Updated Abstract", "gemini-flash-lite-latest")
+            updated = get_page_explanation("doc.pdf", 1)
+            self.assertIn("Updated Abstract", updated["explanation"])
+
+            # 6. Delete page explanation
+            delete_page_explanation("doc.pdf", 1)
+            self.assertIsNone(get_page_explanation("doc.pdf", 1))
+            self.assertIsNotNone(get_page_explanation("doc.pdf", 2))
 
 
 if __name__ == "__main__":

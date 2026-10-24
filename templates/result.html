@@ -95,20 +95,6 @@
                 <div class="alert alert-error">
                     {{ summary_result.error }}
                 </div>
-
-                {% if "API key" in summary_result.error %}
-                <div class="api-key-setup-box">
-                    <h3>Configure Your Google Gemini API Key</h3>
-                    <p>Enter your key below to save it directly to your local <code>.env</code> file, or open <code>.env</code> in your project directory and set <code>GEMINI_API_KEY=your_key</code>.</p>
-                    <form action="{{ url_for('pdf.save_key') }}" method="POST" class="api-key-inline-form">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <input type="password" name="gemini_api_key" placeholder="Paste your Gemini API key (e.g. AIzaSy...)" required class="key-input">
-                        <input type="hidden" name="return_url" value="{{ request.url }}">
-                        <button type="submit" class="btn-primary btn-save-key">Save Key</button>
-                    </form>
-                    <span class="key-hint">Your key is stored only on your local machine and never logged or exposed.</span>
-                </div>
-                {% endif %}
             {% endif %}
         {% else %}
             <p class="ai-placeholder">Click "Generate Summary" to produce an executive overview and key points with Gemini.</p>
@@ -166,19 +152,6 @@
             <div class="alert alert-error">
                 {{ qa_result.error }}
             </div>
-
-            {% if "API key" in qa_result.error %}
-            <div class="api-key-setup-box">
-                <h3>Configure Your Google Gemini API Key</h3>
-                <p>Enter your key below to save it directly to your local <code>.env</code> file:</p>
-                <form action="{{ url_for('pdf.save_key') }}" method="POST" class="api-key-inline-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="password" name="gemini_api_key" placeholder="Paste your Gemini API key (e.g. AIzaSy...)" required class="key-input">
-                    <input type="hidden" name="return_url" value="{{ request.url }}">
-                    <button type="submit" class="btn-primary btn-save-key">Save Key</button>
-                </form>
-            </div>
-            {% endif %}
         {% endif %}
 
         <!-- Conversation History / Turn Cards -->
@@ -265,7 +238,7 @@
     </div>
     {% endif %}
 
-    <!-- Page by Page Extraction Details (Clean Collapsible Accordion) -->
+    <!-- Page-by-Page Explanations (Collapsible Accordion) -->
     {% if pages %}
     <div class="pages-section">
         <div class="section-header-bar">
@@ -274,7 +247,7 @@
                     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
                     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
                 </svg>
-                <h2>Page-by-Page Extracted Content</h2>
+                <h2>Page-by-Page Explanations</h2>
                 <span class="header-count-badge">{{ total_pages }} {{ 'Page' if total_pages == 1 else 'Pages' }}</span>
             </div>
             <div class="accordion-action-buttons">
@@ -289,20 +262,79 @@
                 <summary class="page-accordion-summary">
                     <div class="summary-left">
                         <span class="accordion-arrow">›</span>
-                        <span class="page-heading-title">Page {{ page.page_number }}</span>
+                        <span class="page-heading-title" id="page-heading-{{ page.page_number }}">Page {{ page.page_number }}</span>
+                        {% if page.explanation %}
+                            <span class="page-ai-badge" id="page-badge-{{ page.page_number }}" title="AI Explanation Available">&#10003; Explained</span>
+                        {% else %}
+                            <span class="page-ai-badge" id="page-badge-{{ page.page_number }}" style="display: none;" title="AI Explanation Available">&#10003; Explained</span>
+                        {% endif %}
                     </div>
                     <div class="summary-right">
-                        <span class="page-char-metric">{{ "{:,}".format(page.char_count) }} characters</span>
+                        {% if page.text and page.text.strip() %}
+                            <button type="button" class="btn-action-walkthrough btn-explain-page" data-page="{{ page.page_number }}" data-stored="{{ stored_filename }}" data-original="{{ filename }}" title="Generate or view AI explanation for this page">
+                                {{ 'Regenerate Explanation' if page.explanation else 'Explain Page' }}
+                            </button>
+                        {% endif %}
                     </div>
                 </summary>
                 <div class="page-accordion-body">
-                    {% if page.text and page.text.strip() %}
-                        <div class="extracted-text-wrapper">
-                            <pre class="extracted-text">{{ page.text }}</pre>
+                    <!-- AI Page Explanation Container -->
+                    <div class="page-explanation-wrapper" id="page-explanation-wrap-{{ page.page_number }}" {% if not page.explanation %}style="display: none;"{% endif %}>
+                        <div class="page-explanation-header">
+                            <div class="explanation-title-group">
+                                <svg class="walkthrough-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path>
+                                    <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path>
+                                </svg>
+                                <span class="walkthrough-title-text">AI Page Explanation</span>
+                            </div>
+                            <button type="button" class="btn-subtle btn-refresh-explanation" data-page="{{ page.page_number }}" data-stored="{{ stored_filename }}" data-original="{{ filename }}" title="Regenerate explanation for this page">
+                                &#8635; Regenerate
+                            </button>
                         </div>
-                    {% else %}
-                        <div class="empty-page-box">
-                            <em>No selectable text found on this page (likely a scanned image or rasterized content).</em>
+                        <div class="page-explanation-content markdown-report-container" id="page-explanation-text-{{ page.page_number }}" aria-live="polite">
+                            {% if page.explanation %}
+                                <div class="page-explanation-raw" style="display: none;">{{ page.explanation }}</div>
+                                <noscript>
+                                    <div class="ai-output-text">{{ page.explanation }}</div>
+                                </noscript>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Visual Loading State for Page Explanation -->
+                    <div class="page-explanation-loading" id="page-loading-{{ page.page_number }}" style="display: none;">
+                        <div class="spinner"></div>
+                        <span>Analyzing Page {{ page.page_number }} and generating AI explanation...</span>
+                    </div>
+
+                    <!-- Error State Container (populated dynamically on failure) -->
+                    <div class="page-explanation-error alert alert-error" id="page-error-{{ page.page_number }}" style="display: none;">
+                        <span class="error-msg">Failed to generate explanation.</span>
+                        <button type="button" class="btn-retry-explanation" data-page="{{ page.page_number }}" data-stored="{{ stored_filename }}" data-original="{{ filename }}">
+                            &#8635; Retry
+                        </button>
+                    </div>
+
+                    <!-- Empty / Scanned Page Notice (when no extractable text exists) -->
+                    {% if not (page.text and page.text.strip()) %}
+                        <div class="empty-page-box" id="page-empty-{{ page.page_number }}">
+                            <div class="empty-page-notice">
+                                <svg class="info-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="12" y1="16" x2="12" y2="12"></line>
+                                    <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                </svg>
+                                <span>This page contains no extractable text (e.g. scanned image, visual diagram, or blank page). An AI explanation cannot be derived.</span>
+                            </div>
+                        </div>
+                    {% elif not page.explanation %}
+                        <!-- Placeholder when explanation is not yet generated -->
+                        <div class="page-unexplained-card" id="page-unexplained-{{ page.page_number }}">
+                            <p class="unexplained-text">AI explanation has not been generated for this page yet.</p>
+                            <button type="button" class="btn-action-walkthrough btn-explain-page" data-page="{{ page.page_number }}" data-stored="{{ stored_filename }}" data-original="{{ filename }}">
+                                Explain Page {{ page.page_number }}
+                            </button>
                         </div>
                     {% endif %}
                 </div>

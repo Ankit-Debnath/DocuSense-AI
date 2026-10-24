@@ -19,16 +19,25 @@ DEFAULT_FAST_MODEL = "gemini-flash-lite-latest"
 DEFAULT_TIMEOUT_SECONDS = 30
 
 
+def _is_valid_key_value(val: Optional[str]) -> bool:
+    """
+    Checks if a string is a non-empty, non-placeholder API key.
+    """
+    if not val or not val.strip():
+        return False
+    clean = val.strip().strip("'\"")
+    if clean.lower() in ("your_gemini_api_key_here", "your_key", "your_api_key_here", "your_api_key", "none", "null"):
+        return False
+    return True
+
+
 def get_api_key() -> Optional[str]:
     """
-    Retrieves the Gemini API key from the active environment, .env file, or Flask config.
-    Checks dynamically so edits to .env take effect immediately without server restart.
+    Retrieves the Gemini API key primarily from the local .env file,
+    falling back to active environment or Flask config.
+    Dynamically checks .env so manual edits take effect immediately without server restart.
     """
-    key = os.environ.get("GEMINI_API_KEY")
-    if key and key.strip():
-        return key.strip()
-
-    # Dynamically inspect .env file on disk
+    # 1. Inspect .env file on disk first as the primary source of truth
     env_path = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), ".env")
     if os.path.exists(env_path):
         try:
@@ -38,17 +47,23 @@ def get_api_key() -> Optional[str]:
                     if stripped.startswith("GEMINI_API_KEY="):
                         _, _, val = stripped.partition("=")
                         val = val.strip().strip("'\"")
-                        if val:
+                        if _is_valid_key_value(val):
                             os.environ["GEMINI_API_KEY"] = val
                             return val
         except Exception:
             pass
 
+    # 2. Check active os.environ
+    key = os.environ.get("GEMINI_API_KEY")
+    if _is_valid_key_value(key):
+        return key.strip().strip("'\"")
+
+    # 3. Check Flask current_app config
     try:
         if current_app:
             key = current_app.config.get("GEMINI_API_KEY")
-            if key and key.strip():
-                return key.strip()
+            if _is_valid_key_value(key):
+                return key.strip().strip("'\"")
     except RuntimeError:
         pass
 
@@ -59,6 +74,20 @@ def get_model_name() -> str:
     """
     Retrieves the configured Gemini model name with fallback to DEFAULT_FAST_MODEL.
     """
+    env_path = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("GEMINI_MODEL="):
+                        _, _, val = stripped.partition("=")
+                        val = val.strip().strip("'\"")
+                        if val:
+                            return val
+        except Exception:
+            pass
+
     model = os.environ.get("GEMINI_MODEL")
     if model and model.strip():
         return model.strip()

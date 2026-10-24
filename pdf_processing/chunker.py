@@ -82,13 +82,30 @@ def _tokenize(text: str) -> List[str]:
     return [word.lower() for word in re.findall(r"\b\w+\b", text) if len(word) > 1]
 
 
+def is_broad_query(query: str) -> bool:
+    """
+    Detects whether a user query is asking for a comprehensive, section-by-section,
+    or broad overview of the document (e.g. 'Explain this PDF in detail').
+    """
+    q = (query or "").lower().strip()
+    broad_indicators = (
+        "explain this pdf", "explain the pdf", "explain this document", "explain the document",
+        "explain in detail", "explain this paper", "in detail", "section by section",
+        "detailed explanation", "walk me through", "overview of", "comprehensive summary",
+        "summarize this", "break down this", "what is this document about", "what is this pdf about",
+        "what is this paper about", "explain everything", "full breakdown", "summary of the pdf"
+    )
+    return any(ind in q for ind in broad_indicators)
+
+
 def retrieve_relevant_chunks(
     chunks: List[Dict[str, Any]],
     query: str,
     top_k: int = 4
 ) -> List[Dict[str, Any]]:
     """
-    Retrieves the top-k most relevant passages for a query using keyword frequency scoring.
+    Retrieves the top-k most relevant passages for a query using keyword frequency scoring
+    or balanced document distribution for broad overview inquiries.
     Grounds question answering without needing an external vector database.
 
     Parameters:
@@ -101,6 +118,21 @@ def retrieve_relevant_chunks(
     """
     if not chunks or not query.strip():
         return chunks[:top_k]
+
+    # For broad queries asking for comprehensive or section-by-section explanation,
+    # sample representative chunks distributed across the document
+    if is_broad_query(query) and len(chunks) > top_k:
+        step = len(chunks) / float(top_k)
+        selected_indices = [int(round(i * step)) for i in range(top_k)]
+        seen = set()
+        distributed = []
+        for idx in selected_indices:
+            clamped = min(max(0, idx), len(chunks) - 1)
+            if clamped not in seen:
+                seen.add(clamped)
+                distributed.append(chunks[clamped])
+        if len(distributed) == top_k:
+            return distributed
 
     query_tokens = [t for t in _tokenize(query) if t not in STOPWORDS]
     if not query_tokens:

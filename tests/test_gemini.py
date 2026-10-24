@@ -9,7 +9,7 @@ import pypdf
 from app import create_app
 from config import Config
 from ai.llm_client import create_gemini_client, get_model_name, save_api_key, get_api_key
-from ai.analyzer import summarize_document, answer_pdf_question, prepare_condensed_text
+from ai.analyzer import summarize_document, answer_pdf_question, prepare_condensed_text, explain_page_content
 from pdf_processing.chunker import chunk_extracted_pages, retrieve_relevant_chunks
 
 
@@ -432,6 +432,434 @@ startxref
         # Check session is cleared
         with self.client.session_transaction() as sess:
             self.assertNotIn("qa_history_chat_doc.pdf", sess)
+
+    def test_summary_error_does_not_render_key_input_form(self):
+        """Test that API key errors display the alert without rendering any key input or save form."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Key Test) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "key_err_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        with patch("routes.pdf_routes.summarize_document") as mock_summarize:
+            mock_summarize.return_value = {
+                "success": False,
+                "summary": "",
+                "error": "Invalid or missing Google Gemini API key. Please check your GEMINI_API_KEY in your .env file.",
+                "model_used": "gemini-flash-lite-latest"
+            }
+            res = self.client.post("/summarize", data={
+                "stored_filename": "key_err_doc.pdf",
+                "original_filename": "key_err_doc.pdf",
+                "csrf_token": self.get_csrf_token()
+            })
+            self.assertEqual(res.status_code, 200)
+            self.assertIn(b"Invalid or missing Google Gemini API key", res.data)
+            # Ensure no option/input for pasting or saving the key is rendered in the UI
+            self.assertNotIn(b"Configure Your Google Gemini API Key", res.data)
+            self.assertNotIn(b"name=\"gemini_api_key\"", res.data)
+            self.assertNotIn(b"btn-save-key", res.data)
+            self.assertNotIn(b"Paste your Gemini API key", res.data)
+
+    def test_get_api_key_rejects_placeholder_values(self):
+        """Test that get_api_key ignores placeholder strings and returns None if no real key is set."""
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "your_gemini_api_key_here"}, clear=False), \
+             patch("os.path.exists", return_value=False):
+            key = get_api_key()
+            self.assertIsNone(key)
+
+    def test_summarize_document_prompt_structure(self):
+        """Test that summarize_document constructs a publication-grade research prompt."""
+        pages = [{"page_number": 1, "text": "Paper introducing early-exit neural networks.", "char_count": 45}]
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "# Executive Research & Document Report\n## Document Information\n- **Title:** Test"
+        mock_client.models.generate_content.return_value = mock_response
+
+        summarize_document(
+            pages,
+            client=mock_client,
+            document_title="Deep_Residual_Learning.pdf",
+            total_pages=12
+        )
+
+        call_args = mock_client.models.generate_content.call_args
+        self.assertIsNotNone(call_args)
+        prompt = call_args.kwargs.get("contents") or call_args[1].get("contents") or ""
+        self.assertIn("Executive Research & Document Report", prompt)
+        self.assertIn("Document Information", prompt)
+        self.assertIn("Deep_Residual_Learning.pdf", prompt)
+        self.assertIn("12 pages", prompt)
+        self.assertIn("Executive Overview", prompt)
+        self.assertIn("Key Findings & Core Contributions", prompt)
+        self.assertIn("Quantitative Results & Empirical Benchmarks", prompt)
+        self.assertIn("Detailed Analysis", prompt)
+        self.assertIn("Limitations & Critical Considerations", prompt)
+        self.assertIn("Conclusion & Strategic Implications", prompt)
+
+    def test_answer_pdf_question_prompt_adaptive_structure(self):
+        """Test that answer_pdf_question constructs an adaptive academic response prompt."""
+        pages = [{"page_number": 1, "text": "ResNet utilizes identity skip connections.", "char_count": 42}]
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Direct Answer: ResNet uses skip connections [Page 1]."
+        mock_client.models.generate_content.return_value = mock_response
+
+        answer_pdf_question(
+            pages,
+            "How do residual connections prevent vanishing gradients?",
+            client=mock_client
+        )
+
+        call_args = mock_client.models.generate_content.call_args
+        self.assertIsNotNone(call_args)
+        prompt = call_args.kwargs.get("contents") or call_args[1].get("contents") or ""
+        self.assertIn("Direct Answer", prompt)
+        self.assertIn("Detailed Explanation", prompt)
+        self.assertIn("Key Points & Technical Distinctions", prompt)
+        self.assertIn("Source References", prompt)
+        self.assertIn("The uploaded document does not contain enough evidence to answer this question.", prompt)
+
+    def test_is_broad_query_detection(self):
+        """Test detection of broad/comprehensive queries vs focused inquiries."""
+        from pdf_processing.chunker import is_broad_query
+        self.assertTrue(is_broad_query("Explain this PDF in detail"))
+        self.assertTrue(is_broad_query("Can you walk me through this document?"))
+        self.assertTrue(is_broad_query("Provide an overview of the paper"))
+        self.assertFalse(is_broad_query("What was the batch size used in training?"))
+        self.assertFalse(is_broad_query("Who is the primary author?"))
+
+    def test_broad_query_passage_distribution(self):
+        """Test that broad queries retrieve passages distributed across the document."""
+        from pdf_processing.chunker import retrieve_relevant_chunks
+        chunks = [
+            {"chunk_id": i, "page_number": i, "text": f"Page content paragraph {i}"}
+            for i in range(1, 21)
+        ]
+        distributed = retrieve_relevant_chunks(chunks, query="Explain this PDF in detail", top_k=4)
+        self.assertEqual(len(distributed), 4)
+        page_nums = [c["page_number"] for c in distributed]
+        # Should not all be from page 1, should span across the document
+        self.assertLess(page_nums[0], 5)
+        self.assertGreater(page_nums[-1], 15)
+
+
+    def test_explain_page_content_structure_and_prompt(self):
+        """Test that explain_page_content constructs the required academic prompt and returns parsed result."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = (
+            "# Page 3 — Methodology and Dynamic Architecture\n\n"
+            "This page establishes the mathematical formulation for entropy-based early exiting.\n\n"
+            "### Proposed Formulation\nDetailed technical analysis of the loss function.\n\n"
+            r"### Important Technical Details\n- Metric: Cross-entropy $\mathcal{H}(p)$" "\n\n"
+            r"### Key Takeaways\n- Early-exit threshold $\tau=0.15$" "\n\n"
+            "### Source Context\n- Page 3; Equation (4); Figure 2."
+        )
+        mock_client.models.generate_content.return_value = mock_response
+
+        result = explain_page_content(
+            page_number=3,
+            page_text="This page introduces the mathematical formulation of cross-entropy early exit with threshold tau = 0.15.",
+            total_pages=15,
+            document_title="Deep_Exit.pdf",
+            client=mock_client,
+            model_name="gemini-2.5-flash"
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["page_number"], 3)
+        self.assertEqual(result["model_used"], "gemini-2.5-flash")
+        self.assertIn("# Page 3 — Methodology", result["explanation"])
+        self.assertIn("timing_ms", result)
+
+        # Inspect prompt passed to Gemini
+        call_args = mock_client.models.generate_content.call_args
+        self.assertIsNotNone(call_args)
+        prompt = call_args.kwargs.get("contents") or call_args[1].get("contents") or ""
+        self.assertIn("Page 3 of 15", prompt)
+        self.assertIn("Deep_Exit.pdf", prompt)
+        self.assertIn("# Page 3", prompt)
+        self.assertIn("Page Overview", prompt)
+        self.assertIn("Detailed Explanation", prompt)
+        self.assertIn("Important Technical Details", prompt)
+        self.assertIn("Key Takeaways", prompt)
+        self.assertIn("Source References & Citations", prompt)
+
+    def test_explain_page_content_empty_text(self):
+        """Test that explain_page_content handles empty or blank pages without calling the API."""
+        mock_client = MagicMock()
+        result = explain_page_content(page_number=4, page_text="   \n \t ", client=mock_client)
+        self.assertFalse(result["success"])
+        self.assertIn("no extractable text", result["error"].lower())
+        mock_client.models.generate_content.assert_not_called()
+
+    def test_explain_page_content_rate_limit_error(self):
+        """Test graceful translation of quota/rate-limit exceptions in explain_page_content."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("429 ResourceExhausted: Quota exceeded")
+
+        result = explain_page_content(
+            page_number=1,
+            page_text="Valid page text content.",
+            client=mock_client
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("rate limit or quota exceeded", result["error"])
+
+    def test_explain_page_endpoint_form_and_caching(self):
+        """Test /explain-page endpoint handles form requests, caches in SQLite, and regenerates properly."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Page 1 content) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "explain_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        with patch("routes.pdf_routes.explain_page_content") as mock_explain:
+            mock_explain.return_value = {
+                "success": True,
+                "page_number": 1,
+                "explanation": "# Page 1 — Introduction and Abstract\nWalkthrough body.",
+                "model_used": "gemini-flash-lite-latest",
+                "timing_ms": {"api_ms": 120.0}
+            }
+
+            # 1. First call: Cache miss, calls explain_page_content
+            res1 = self.client.post("/explain-page", data={
+                "stored_filename": "explain_doc.pdf",
+                "original_filename": "paper.pdf",
+                "page_number": "1",
+                "csrf_token": self.get_csrf_token()
+            })
+            self.assertEqual(res1.status_code, 200)
+            data1 = res1.get_json()
+            self.assertTrue(data1["success"])
+            self.assertFalse(data1["cached"])
+            self.assertIn("Page 1 — Introduction and Abstract", data1["explanation"])
+            self.assertEqual(mock_explain.call_count, 1)
+
+            # 2. Second call: Cache hit from SQLite, does not call explain_page_content
+            res2 = self.client.post("/explain-page", data={
+                "stored_filename": "explain_doc.pdf",
+                "original_filename": "paper.pdf",
+                "page_number": "1",
+                "csrf_token": self.get_csrf_token()
+            })
+            self.assertEqual(res2.status_code, 200)
+            data2 = res2.get_json()
+            self.assertTrue(data2["success"])
+            self.assertTrue(data2["cached"])
+            self.assertEqual(mock_explain.call_count, 1)
+
+            # 3. Third call: Force regenerate with regenerate="true"
+            mock_explain.return_value = {
+                "success": True,
+                "page_number": 1,
+                "explanation": "# Page 1 — Regenerated Walkthrough\nNew body.",
+                "model_used": "gemini-flash-lite-latest",
+                "timing_ms": {"api_ms": 110.0}
+            }
+            res3 = self.client.post("/explain-page", data={
+                "stored_filename": "explain_doc.pdf",
+                "original_filename": "paper.pdf",
+                "page_number": "1",
+                "regenerate": "true",
+                "csrf_token": self.get_csrf_token()
+            })
+            self.assertEqual(res3.status_code, 200)
+            data3 = res3.get_json()
+            self.assertTrue(data3["success"])
+            self.assertFalse(data3["cached"])
+            self.assertIn("Regenerated Walkthrough", data3["explanation"])
+            self.assertEqual(mock_explain.call_count, 2)
+
+    def test_explain_page_endpoint_json_payload(self):
+        """Test /explain-page endpoint when invoked via JSON payload with CSRF headers."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Page 1 content) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "json_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        with patch("routes.pdf_routes.explain_page_content") as mock_explain:
+            mock_explain.return_value = {
+                "success": True,
+                "page_number": 1,
+                "explanation": "# Page 1 — JSON API Test\nJSON response.",
+                "model_used": "gemini-flash-lite-latest",
+                "timing_ms": {"api_ms": 95.0}
+            }
+
+            token = self.get_csrf_token()
+            res = self.client.post(
+                "/explain-page",
+                json={
+                    "stored_filename": "json_doc.pdf",
+                    "original_filename": "paper.pdf",
+                    "page_number": 1
+                },
+                headers={"X-CSRFToken": token}
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertTrue(data["success"])
+            self.assertIn("JSON API Test", data["explanation"])
+
+    def test_explain_page_endpoint_validation_and_errors(self):
+        """Test input validation, out-of-bounds pages, and file traversal in /explain-page."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Page 1) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "valid_one_page.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+
+        # 1. Non-digit page number -> 400
+        res = self.client.post("/explain-page", data={
+            "stored_filename": "valid_one_page.pdf",
+            "page_number": "abc",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("Invalid or missing page number", res.get_json()["error"])
+
+        # 2. Path traversal stored_filename -> 404
+        res = self.client.post("/explain-page", data={
+            "stored_filename": "../../secret.pdf",
+            "page_number": "1",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 404)
+
+        # 3. Page number out of bounds -> 404
+        res = self.client.post("/explain-page", data={
+            "stored_filename": "valid_one_page.pdf",
+            "page_number": "999",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("not found in document", res.get_json()["error"])
+
+    def test_page_wise_interface_excludes_raw_extracted_text(self):
+        """Regression test: verify raw extracted PDF text is completely excluded from the page-wise UI."""
+        pdf_raw_sentence = "CONFIDENTIAL_UNPROCESSED_RAW_EXTRACTED_SENTENCE_123"
+        pdf_content = (
+            b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+            b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
+            b"3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n"
+            b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n"
+            b"5 0 obj << /Length 65 >> stream\n"
+            b"BT /F1 12 Tf 100 700 Td (" + pdf_raw_sentence.encode("utf-8") + b") Tj ET\n"
+            b"endstream\nendobj\nxref\n0 6\n0000000000 65535 f \n"
+            b"0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \n"
+            b"trailer << /Root 1 0 R /Size 6 >>\nstartxref\n455\n%%EOF"
+        )
+
+        test_pdf_path = os.path.join(self.test_upload_dir, "clean_ui_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+        res = self.client.post("/summarize", data={
+            "stored_filename": "clean_ui_doc.pdf",
+            "original_filename": "clean_ui_doc.pdf",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 200)
+        html = res.data.decode("utf-8")
+
+        # 1. Assert no raw-text accordion or pre tag exists
+        self.assertNotIn("raw-text-accordion", html)
+        self.assertNotIn("extracted-text", html)
+        self.assertNotIn("page-char-metric", html)
+
+        # 2. Assert raw extracted sentence is NOT in the pages section
+        pages_section_start = html.find('class="pages-section"')
+        self.assertGreater(pages_section_start, -1)
+        pages_section_html = html[pages_section_start:]
+        self.assertNotIn(pdf_raw_sentence, pages_section_html)
+
+    def test_failed_explanation_generation_does_not_fall_back_to_raw_text(self):
+        """Regression test: verify API failure does not substitute raw text into the explanation response."""
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Page 1) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "fail_fallback_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        token = self.get_csrf_token()
+
+        with patch("routes.pdf_routes.explain_page_content") as mock_explain:
+            mock_explain.return_value = {
+                "success": False,
+                "page_number": 1,
+                "explanation": "",
+                "error": "Gemini API Quota Exceeded. Please retry.",
+                "model_used": "gemini-flash-lite-latest",
+                "timing_ms": {"api_ms": 10.0}
+            }
+
+            res = self.client.post("/explain-page", data={
+                "stored_filename": "fail_fallback_doc.pdf",
+                "page_number": "1",
+                "csrf_token": token
+            })
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertFalse(data["success"])
+            self.assertEqual(data.get("explanation"), "")
+            self.assertIn("Quota Exceeded", data["error"])
+            self.assertNotEqual(data.get("explanation"), "Page 1")
+
+    def test_cached_explanation_displayed_without_raw_text(self):
+        """Regression test: verify cached explanation displays cleanly without any raw text fallback."""
+        from database.models import save_page_explanation
+
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Page 1) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "cached_view_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        # Seed cached explanation in SQLite
+        save_page_explanation(
+            filename="cached_view_doc.pdf",
+            page_number=1,
+            explanation="# Page 1 — Deep Overview\nGenuine academic explanation.",
+            model_used="gemini-flash-lite-latest",
+            db_path=self.test_db_path
+        )
+
+        token = self.get_csrf_token()
+        res = self.client.post("/summarize", data={
+            "stored_filename": "cached_view_doc.pdf",
+            "original_filename": "cached_view_doc.pdf",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 200)
+        html = res.data.decode("utf-8")
+
+        self.assertIn("Genuine academic explanation", html)
+        self.assertIn("&#10003; Explained", html)
+        self.assertNotIn("raw-text-accordion", html)
+        self.assertNotIn("extracted-text", html)
+
+    def test_empty_or_image_only_pages_handled_appropriately(self):
+        """Regression test: verify blank/scanned pages show clear notice and do not crash or show raw text."""
+        import pypdf
+        writer = pypdf.PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        blank_pdf_path = os.path.join(self.test_upload_dir, "blank_page_doc.pdf")
+        with open(blank_pdf_path, "wb") as f:
+            writer.write(f)
+
+        token = self.get_csrf_token()
+        res = self.client.post("/summarize", data={
+            "stored_filename": "blank_page_doc.pdf",
+            "original_filename": "blank_page_doc.pdf",
+            "csrf_token": token
+        })
+        self.assertEqual(res.status_code, 200)
+        html = res.data.decode("utf-8")
+
+        self.assertIn("empty-page-box", html)
+        self.assertIn("This page contains no extractable text", html)
+        self.assertNotIn("raw-text-accordion", html)
 
 
 if __name__ == "__main__":
