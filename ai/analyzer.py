@@ -6,10 +6,21 @@ Features bounded text condensation, structured latency logging, and robust error
 """
 
 import logging
+import random
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from flask import current_app
+
+try:
+    from google.genai import errors as genai_errors
+except ImportError:
+    genai_errors = None
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 from ai.llm_client import create_gemini_client, get_model_name
 from pdf_processing.chunker import chunk_extracted_pages, retrieve_relevant_chunks, is_broad_query
@@ -24,6 +35,247 @@ if not logger.handlers:
 
 # Default character budget for summarization prompts (bounded condensation)
 DEFAULT_MAX_SUMMARY_CHARACTERS = 16000
+
+# Default retry configuration constants (bounded to max 2 attempts total)
+DEFAULT_MAX_RETRIES = 1         # 1 retry = 2 attempts total (initial attempt + 1 retry)
+DEFAULT_INITIAL_DELAY = 1.0     # Initial backoff delay in seconds
+DEFAULT_MAX_DELAY = 4.0         # Maximum backoff delay in seconds
+DEFAULT_BACKOFF_FACTOR = 2.0    # Exponential backoff factor
+
+
+def _default_sleep(seconds: float) -> None:
+    """
+    Default sleep function wrapper allowing clean test mocking.
+    Skips real sleeps during automated tests if current_app is in TESTING mode.
+    """
+    try:
+        if current_app and current_app.config.get("TESTING"):
+            return
+    except RuntimeError:
+        pass
+    time.sleep(seconds)
+
+
+def _is_permanent_quota_exhausted(exc: Exception, err_str: str) -> bool:
+    """
+    Determines whether a 429/ResourceExhausted failure is a permanent
+    quota or billing restriction rather than a transient burst rate limit.
+    """
+    perm_markers = ("daily", "per day", "billing", "credit", "free tier", "plan limit", "insufficient_quota")
+    trans_markers = ("per minute", "rate limit", "requests per minute", "tokens per minute", "tpm", "rpm")
+
+    # If any permanent marker is present and no transient rate-limit marker is present
+    if any(m in err_str for m in perm_markers):
+        if not any(m in err_str for m in trans_markers):
+            return True
+
+    # Check details if available
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        err_obj = details.get("error", details)
+        sub_details = err_obj.get("details", []) if isinstance(err_obj, dict) else []
+        if isinstance(sub_details, list):
+            for item in sub_details:
+                if isinstance(item, dict):
+                    violations = item.get("violations", [])
+                    for v in violations:
+                        desc = str(v.get("description", "")).lower()
+                        if any(m in desc for m in perm_markers) and not any(m in desc for m in trans_markers):
+                            return True
+
+    return False
+
+
+def _extract_retry_delay(exc: Exception) -> Optional[float]:
+    """
+    Safely extracts provider-specified retry delay in seconds if available.
+    Inspects:
+      1. e.response.headers['retry-after']
+      2. e.details (google.rpc.RetryInfo.retryDelay)
+    Returns positive float in seconds, or None.
+    """
+    # 1. Check HTTP response headers for Retry-After
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers and hasattr(headers, "get"):
+            retry_after = headers.get("retry-after")
+            if retry_after is not None:
+                try:
+                    val = float(str(retry_after).strip())
+                    if val >= 0:
+                        return val
+                except (ValueError, TypeError):
+                    pass
+
+    # 2. Check details dictionary in APIError
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        err_obj = details.get("error", details)
+        sub_details = err_obj.get("details", []) if isinstance(err_obj, dict) else []
+        if isinstance(sub_details, list):
+            for item in sub_details:
+                if isinstance(item, dict) and "RetryInfo" in str(item.get("@type", "")):
+                    delay_str = item.get("retryDelay")
+                    if delay_str:
+                        clean = str(delay_str).rstrip("sS").strip()
+                        try:
+                            val = float(clean)
+                            if val >= 0:
+                                return val
+                        except (ValueError, TypeError):
+                            pass
+
+    return None
+
+
+def _classify_exception(exc: Exception) -> Tuple[bool, str, Optional[float]]:
+    """
+    Classifies an exception to determine retry eligibility.
+    Returns:
+        (is_retryable: bool, category: str, retry_after: Optional[float])
+    """
+    # 1. Programming errors are non-retryable
+    if isinstance(exc, (TypeError, ValueError, KeyError, AttributeError, NameError)):
+        return False, "programming_error", None
+
+    err_str = str(exc).lower()
+    retry_delay = _extract_retry_delay(exc)
+
+    # 2. Inspect code attribute on exception (e.g. APIError.code)
+    code = getattr(exc, "code", None)
+    if code is None and genai_errors and isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+
+    # If code is not an attribute, check for leading HTTP status code in message
+    if code is None:
+        first_token = err_str.split()[0] if err_str else ""
+        if first_token.isdigit() and len(first_token) == 3:
+            code = int(first_token)
+
+    if code is not None:
+        # Non-retryable client errors: 400 (Bad Request), 401 (Unauthorized), 403 (Forbidden), 404 (Not Found)
+        if code in (400, 401, 403, 404):
+            return False, "client_error_permanent", None
+
+        # Server errors: 500, 502, 503, 504 (or any 5xx)
+        if 500 <= code < 600:
+            return True, "server_error", retry_delay
+
+        # 429 Rate limit vs Quota exhaustion
+        if code == 429:
+            if _is_permanent_quota_exhausted(exc, err_str):
+                return False, "quota_exhausted", None
+            return True, "rate_limit", retry_delay
+
+    # 3. Check SDK error subclasses
+    if genai_errors and isinstance(exc, genai_errors.ServerError):
+        return True, "server_error", retry_delay
+
+    if genai_errors and isinstance(exc, genai_errors.ClientError):
+        if getattr(exc, "code", None) == 429 or "429" in err_str:
+            if _is_permanent_quota_exhausted(exc, err_str):
+                return False, "quota_exhausted", None
+            return True, "rate_limit", retry_delay
+        return False, "client_error_permanent", None
+
+    # 4. Check transport timeouts and connection errors
+    if httpx and isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return True, "network_error", None
+
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True, "network_error", None
+
+    # 5. Fallback to message keyword matching
+    if any(k in err_str for k in ("unauthenticated", "api_key", "permission_denied")):
+        return False, "auth_error", None
+    if any(k in err_str for k in ("invalid_argument", "not_found", "model not found")):
+        return False, "invalid_request", None
+    if any(k in err_str for k in ("500", "502", "503", "504", "server error", "service unavailable", "bad gateway")):
+        return True, "server_error", retry_delay
+    if any(k in err_str for k in ("deadline", "timed out", "timeout", "connection reset", "connection refused", "failed to connect")):
+        return True, "network_error", None
+    if "429" in err_str or "resource_exhausted" in err_str:
+        if _is_permanent_quota_exhausted(exc, err_str):
+            return False, "quota_exhausted", None
+        return True, "rate_limit", retry_delay
+
+    return False, "unknown_error", None
+
+
+def _execute_with_retry(
+    call_fn: Callable[[], Any],
+    operation_name: str = "Gemini API call",
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    initial_delay: float = DEFAULT_INITIAL_DELAY,
+    max_delay: float = DEFAULT_MAX_DELAY,
+    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> Any:
+    """
+    Executes a callable with bounded retries and exponential backoff with jitter
+    for transient Gemini API failures (HTTP 429 rate limits, 5xx server errors, network timeouts).
+    Fails fast on permanent client errors (HTTP 400, 401, 403, 404, programming errors).
+    Respects Retry-After / provider retry delays when bounded by max_delay.
+    """
+    effective_sleep = sleep_fn if sleep_fn is not None else _default_sleep
+    total_attempts = 1 + max(0, max_retries)
+
+    for attempt in range(total_attempts):
+        try:
+            return call_fn()
+        except Exception as exc:
+            is_last_attempt = (attempt == total_attempts - 1)
+            retryable, category, retry_after = _classify_exception(exc)
+
+            if is_last_attempt or not retryable:
+                if not retryable:
+                    logger.info(
+                        "[PERF] %s failed with non-retryable error (%s: %s). Fast-failing on attempt %d/%d.",
+                        operation_name,
+                        type(exc).__name__,
+                        category,
+                        attempt + 1,
+                        total_attempts,
+                    )
+                else:
+                    logger.warning(
+                        "[PERF] %s retries exhausted after %d attempts. Final error: %s (%s).",
+                        operation_name,
+                        total_attempts,
+                        type(exc).__name__,
+                        category,
+                    )
+                raise exc
+
+            # Calculate backoff delay
+            if retry_after is not None:
+                if retry_after > max_delay:
+                    logger.warning(
+                        "[PERF] %s received provider retry delay (%.2fs) exceeding max backoff (%.2fs). Aborting retry.",
+                        operation_name,
+                        retry_after,
+                        max_delay,
+                    )
+                    raise exc
+                # Valid provider delay within budget
+                delay = retry_after
+            else:
+                # Exponential backoff with random jitter between 0 and calculated backoff cap
+                backoff_cap = min(max_delay, initial_delay * (backoff_factor ** attempt))
+                delay = random.uniform(0.0, backoff_cap)
+
+            logger.info(
+                "[PERF] %s encountered retryable %s (%s). Retrying (attempt %d/%d) in %.2fs...",
+                operation_name,
+                category,
+                type(exc).__name__,
+                attempt + 1,
+                total_attempts,
+                delay,
+            )
+
+            effective_sleep(delay)
 
 
 def get_max_summary_characters() -> int:
@@ -42,18 +294,42 @@ def _format_error_message(exception: Exception) -> str:
     """
     Translates low-level or SDK exceptions into user-friendly messages
     without leaking internal stack traces or credentials.
+    Distinguishes temporary rate limits, permanent quota/billing exhaustion,
+    temporary server failures, network timeouts, and authentication errors.
     """
     err_str = str(exception).lower()
+    code = getattr(exception, "code", None)
+    if code is None:
+        first_token = err_str.split()[0] if err_str else ""
+        if first_token.isdigit() and len(first_token) == 3:
+            code = int(first_token)
 
-    if "api_key" in err_str or "unauthenticated" in err_str:
+    # 1. Authentication / Permission errors
+    if code in (401, 403) or "api_key" in err_str or "unauthenticated" in err_str or "permission_denied" in err_str:
         return "Invalid or missing Google Gemini API key. Please check your GEMINI_API_KEY in your .env file."
-    if "not_found" in err_str or "model" in err_str:
+
+    # 2. Model not found
+    if code == 404 or "not_found" in err_str or "model" in err_str:
         return "The configured Gemini model was not found or is unavailable. Please check GEMINI_MODEL."
-    if "invalid_argument" in err_str:
-        return "Invalid or missing Google Gemini API key. Please check your GEMINI_API_KEY in your .env file."
-    if "resource_exhausted" in err_str or "429" in err_str or "quota" in err_str:
+
+    # 3. Invalid argument / request configuration
+    if code == 400 or "invalid_argument" in err_str:
+        return "Invalid request configuration for Google Gemini. Please check your parameters."
+
+    # 4. Confirmed quota exhaustion / billing
+    if _is_permanent_quota_exhausted(exception, err_str):
+        return "Gemini API quota has been exhausted or billing is inactive for this project. Please check your Google AI Studio account."
+
+    # 5. Temporary rate limit
+    if code == 429 or "resource_exhausted" in err_str or "429" in err_str or "quota" in err_str:
         return "Gemini API rate limit or quota exceeded. Please wait a moment and try again."
-    if "deadline" in err_str or "timeout" in err_str or "connection" in err_str:
+
+    # 6. Temporary server errors (5xx)
+    if (code and 500 <= code < 600) or any(k in err_str for k in ("500", "502", "503", "504", "server error", "service unavailable")):
+        return "Google Gemini service is temporarily unavailable after retrying. Please try again shortly."
+
+    # 7. Network timeouts and connection errors
+    if any(k in err_str for k in ("deadline", "timeout", "timed out", "connection", "connect")):
         return "Network timeout while communicating with Google Gemini. Please verify your connection."
 
     return "An error occurred while processing the request with Gemini. Please try again later."
@@ -270,9 +546,12 @@ Document Content:
     api_t0 = time.perf_counter()
     try:
         active_client = client or create_gemini_client()
-        response = active_client.models.generate_content(
-            model=resolved_model,
-            contents=prompt
+        response = _execute_with_retry(
+            lambda: active_client.models.generate_content(
+                model=resolved_model,
+                contents=prompt
+            ),
+            operation_name=f"Gemini Summarize ({resolved_model})"
         )
         api_ms = (time.perf_counter() - api_t0) * 1000
         total_ms = (time.perf_counter() - overall_t0) * 1000
@@ -447,9 +726,12 @@ User Question:
     api_t0 = time.perf_counter()
     try:
         active_client = client or create_gemini_client()
-        response = active_client.models.generate_content(
-            model=resolved_model,
-            contents=prompt
+        response = _execute_with_retry(
+            lambda: active_client.models.generate_content(
+                model=resolved_model,
+                contents=prompt
+            ),
+            operation_name=f"Gemini QA ({resolved_model})"
         )
         api_ms = (time.perf_counter() - api_t0) * 1000
         total_ms = (time.perf_counter() - overall_t0) * 1000
@@ -602,9 +884,12 @@ Extracted Text from Page {page_number}:
     api_t0 = time.perf_counter()
     try:
         active_client = client or create_gemini_client()
-        response = active_client.models.generate_content(
-            model=resolved_model,
-            contents=prompt
+        response = _execute_with_retry(
+            lambda: active_client.models.generate_content(
+                model=resolved_model,
+                contents=prompt
+            ),
+            operation_name=f"Gemini Page Explain ({resolved_model}, p{page_number})"
         )
         api_ms = (time.perf_counter() - api_t0) * 1000
         total_ms = (time.perf_counter() - overall_t0) * 1000

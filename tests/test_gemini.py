@@ -1010,5 +1010,314 @@ startxref
             self.assertIn("page-citation-pill", html)
 
 
+class GeminiRetryTestCase(unittest.TestCase):
+    """
+    Focused regression test suite for Phase 3, Step 2:
+    Bounded Gemini API retries, exponential backoff with jitter,
+    Retry-After provider delay handling, and non-retryable fast-fail.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.test_upload_dir = os.path.join(self.test_dir, "uploads")
+        self.test_instance_dir = os.path.join(self.test_dir, "instance")
+        self.test_db_path = os.path.join(self.test_instance_dir, "test.db")
+
+        class CustomConfig(TestGeminiConfig):
+            UPLOAD_FOLDER = self.test_upload_dir
+            INSTANCE_FOLDER = self.test_instance_dir
+            DATABASE_PATH = self.test_db_path
+
+        self.app = create_app(CustomConfig)
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def get_csrf_token(self):
+        res = self.client.get("/")
+        m = re.search(r'name="csrf_token"\s+value="([^"]+)"', res.data.decode("utf-8"))
+        return m.group(1) if m else ""
+
+    # -------------------------------------------------------------------------
+    # A. Successful Recovery
+    # -------------------------------------------------------------------------
+    def test_successful_recovery_on_transient_server_error(self):
+        """Test that a transient HTTP 503 error on attempt 1 retries and succeeds on attempt 2."""
+        from google.genai import errors as genai_errors
+
+        pages = [{"page_number": 1, "text": "Important research findings on neural optimization.", "char_count": 52}]
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "### Executive Overview\nOptimal convergence verified."
+
+        server_err = genai_errors.ServerError(503, {"error": {"code": 503, "message": "Service Unavailable"}})
+        mock_client.models.generate_content.side_effect = [server_err, mock_response]
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = summarize_document(pages, client=mock_client)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["summary"], mock_response.text)
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once()
+
+    # -------------------------------------------------------------------------
+    # B. Retry Exhaustion
+    # -------------------------------------------------------------------------
+    def test_retry_exhaustion_on_persistent_5xx_error(self):
+        """Test that persistent 5xx server errors retry once (2 attempts total) and stop without looping."""
+        from google.genai import errors as genai_errors
+
+        pages = [{"page_number": 1, "text": "Valid document text.", "char_count": 20}]
+        mock_client = MagicMock()
+        server_err = genai_errors.ServerError(500, {"error": {"code": 500, "message": "Internal Server Error"}})
+        mock_client.models.generate_content.side_effect = server_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = summarize_document(pages, client=mock_client)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once()
+        self.assertIn("temporarily unavailable after retrying", result["error"])
+
+    # -------------------------------------------------------------------------
+    # C. Permanent Non-Retryable Errors (Fast-Fail)
+    # -------------------------------------------------------------------------
+    def test_permanent_authentication_error_fails_immediately_without_retry(self):
+        """Test that HTTP 401 unauthenticated errors fail immediately on attempt 1."""
+        from google.genai import errors as genai_errors
+
+        pages = [{"page_number": 1, "text": "Valid document text.", "char_count": 20}]
+        mock_client = MagicMock()
+        auth_err = genai_errors.ClientError(401, {"error": {"code": 401, "message": "API key not valid. Please pass a valid API key."}})
+        mock_client.models.generate_content.side_effect = auth_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = summarize_document(pages, client=mock_client)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertIn("Invalid or missing Google Gemini API key", result["error"])
+
+    def test_permanent_invalid_argument_fails_immediately_without_retry(self):
+        """Test that HTTP 400 Bad Request / Invalid Argument fails on attempt 1."""
+        from google.genai import errors as genai_errors
+
+        pages = [{"page_number": 1, "text": "Valid document text.", "char_count": 20}]
+        mock_client = MagicMock()
+        invalid_err = genai_errors.ClientError(400, {"error": {"code": 400, "message": "Invalid argument specified."}})
+        mock_client.models.generate_content.side_effect = invalid_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = summarize_document(pages, client=mock_client)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertIn("Invalid request configuration", result["error"])
+
+    def test_permanent_quota_exhaustion_fails_immediately_without_retry(self):
+        """Test that confirmed daily/billing quota exhaustion does not retry and gives distinct message."""
+        from google.genai import errors as genai_errors
+
+        pages = [{"page_number": 1, "text": "Valid document text.", "char_count": 20}]
+        mock_client = MagicMock()
+        quota_exhausted_err = genai_errors.ClientError(429, {"error": {"code": 429, "message": "Daily quota exceeded for free tier. Check your billing."}})
+        mock_client.models.generate_content.side_effect = quota_exhausted_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = summarize_document(pages, client=mock_client)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertIn("quota has been exhausted or billing is inactive", result["error"])
+
+    # -------------------------------------------------------------------------
+    # D. Transport & Timeout Errors
+    # -------------------------------------------------------------------------
+    def test_transport_timeout_retries_and_recovers(self):
+        """Test that httpx transport timeouts are retried."""
+        import httpx
+
+        pages = [{"page_number": 1, "text": "Grounded question context.", "char_count": 25}]
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Answer grounded in document [Page 1]."
+
+        timeout_err = httpx.ReadTimeout("Read timed out from server.")
+        mock_client.models.generate_content.side_effect = [timeout_err, mock_response]
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = answer_pdf_question(pages, "What was found?", client=mock_client)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once()
+
+    def test_transport_connection_error_exhaustion(self):
+        """Test that persistent network connection errors exhaust retries and give clear message."""
+        import httpx
+
+        pages = [{"page_number": 1, "text": "Grounded question context.", "char_count": 25}]
+        mock_client = MagicMock()
+        connect_err = httpx.ConnectError("Failed to establish TCP connection.")
+        mock_client.models.generate_content.side_effect = connect_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = answer_pdf_question(pages, "What was found?", client=mock_client)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once()
+        self.assertIn("Network timeout while communicating", result["error"])
+
+    # -------------------------------------------------------------------------
+    # E. Backoff and Jitter Verification
+    # -------------------------------------------------------------------------
+    def test_backoff_and_jitter_delay_bounds(self):
+        """Test that exponential backoff calculates expected cap and applies randomized jitter."""
+        from ai.analyzer import _execute_with_retry
+        from google.genai import errors as genai_errors
+
+        sleep_calls = []
+
+        def recording_sleep(s):
+            sleep_calls.append(s)
+
+        calls = [0]
+
+        def flaky_call():
+            calls[0] += 1
+            if calls[0] == 1:
+                raise genai_errors.ServerError(503, {"error": {"code": 503, "message": "Service Unavailable"}})
+            return "SUCCESS"
+
+        with patch("random.uniform", return_value=0.75) as mock_random:
+            res = _execute_with_retry(
+                flaky_call,
+                operation_name="Test Backoff",
+                max_retries=1,
+                initial_delay=1.0,
+                max_delay=4.0,
+                backoff_factor=2.0,
+                sleep_fn=recording_sleep
+            )
+
+        self.assertEqual(res, "SUCCESS")
+        self.assertEqual(calls[0], 2)
+        # Attempt 0 backoff cap is min(4.0, 1.0 * (2^0)) = 1.0
+        mock_random.assert_called_once_with(0.0, 1.0)
+        self.assertEqual(sleep_calls, [0.75])
+
+    # -------------------------------------------------------------------------
+    # F. Retry-After Header Handling
+    # -------------------------------------------------------------------------
+    def test_retry_after_within_budget_is_respected(self):
+        """Test that a valid provider-specified Retry-After within budget is respected."""
+        import httpx
+        from google.genai import errors as genai_errors
+
+        resp = httpx.Response(429, headers={"Retry-After": "2.5"})
+        rate_err = genai_errors.ClientError(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}, response=resp)
+
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = "Explained successfully on retry."
+        mock_client.models.generate_content.side_effect = [rate_err, mock_response]
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = explain_page_content(
+                page_number=1,
+                page_text="Page text walkthrough.",
+                client=mock_client
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
+        mock_sleep.assert_called_once_with(2.5)
+
+    def test_retry_after_exceeding_budget_aborts_without_early_retry(self):
+        """Test that a provider Retry-After exceeding maximum backoff (e.g. 30s > 4s) aborts immediately."""
+        import httpx
+        from google.genai import errors as genai_errors
+
+        resp = httpx.Response(429, headers={"Retry-After": "30.0"})
+        rate_err = genai_errors.ClientError(429, {"error": {"code": 429, "message": "Rate limit exceeded"}}, response=resp)
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = rate_err
+
+        with patch("ai.analyzer._default_sleep") as mock_sleep:
+            result = explain_page_content(
+                page_number=1,
+                page_text="Page text walkthrough.",
+                client=mock_client
+            )
+
+        self.assertFalse(result["success"])
+        # Should abort on attempt 1 without retrying early
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+        mock_sleep.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # H. Cache & Database Side-Effect Verification
+    # -------------------------------------------------------------------------
+    def test_retry_does_not_duplicate_sqlite_cache_writes(self):
+        """Test that retrying a transient error produces exactly one cached record in SQLite upon recovery."""
+        from google.genai import errors as genai_errors
+        from database.models import get_document_summary
+
+        pdf_content = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj\n4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n5 0 obj << /Length 30 >> stream\nBT /F1 12 Tf 100 700 Td (Cached Retry Doc) Tj ET\nendstream\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000262 00000 n \n0000000341 00000 n \ntrailer << /Root 1 0 R /Size 6 >>\nstartxref\n420\n%%EOF"
+        test_pdf_path = os.path.join(self.test_upload_dir, "retry_doc.pdf")
+        with open(test_pdf_path, "wb") as f:
+            f.write(pdf_content)
+
+        # Mock summarize_document with recovery on retry
+        mock_response = MagicMock()
+        mock_response.text = "Executive summary recovered on retry."
+
+        server_err = genai_errors.ServerError(503, {"error": {"code": 503, "message": "Service Unavailable"}})
+
+        with patch("google.genai.Client") as mock_client_cls, \
+             patch("ai.analyzer._default_sleep") as mock_sleep:
+
+            mock_client = MagicMock()
+            mock_client.models.generate_content.side_effect = [server_err, mock_response]
+            mock_client_cls.return_value = mock_client
+
+            res = self.client.post("/summarize", data={
+                "stored_filename": "retry_doc.pdf",
+                "original_filename": "retry_doc.pdf",
+                "csrf_token": self.get_csrf_token()
+            })
+
+            self.assertEqual(res.status_code, 200)
+            self.assertIn(b"Executive summary recovered on retry.", res.data)
+            self.assertEqual(mock_client.models.generate_content.call_count, 2)
+            mock_sleep.assert_called_once()
+
+            # Verify exactly ONE record was written to SQLite
+            with self.app.app_context():
+                cached = get_document_summary("retry_doc.pdf")
+                self.assertIsNotNone(cached)
+                self.assertEqual(cached["summary"], "Executive summary recovered on retry.")
+
+            # Second request: Cache hit without any more API calls
+            res2 = self.client.post("/summarize", data={
+                "stored_filename": "retry_doc.pdf",
+                "original_filename": "retry_doc.pdf",
+                "csrf_token": self.get_csrf_token()
+            })
+            self.assertEqual(res2.status_code, 200)
+            self.assertIn(b"Cached in SQLite", res2.data)
+            # Call count remains 2 (saved Gemini call)
+            self.assertEqual(mock_client.models.generate_content.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
