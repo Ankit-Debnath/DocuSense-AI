@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import shutil
@@ -126,10 +127,20 @@ class GeminiAITestCase(unittest.TestCase):
         ]
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = "Project Apollo landed on the moon in July 1969 [Page 1]."
+        mock_response.text = json.dumps({
+            "answer": "Project Apollo landed on the moon in July 1969 [Page 1].",
+            "citations": [
+                {
+                    "evidence_id": "E1",
+                    "page_number": 1,
+                    "supporting_quote": "Project Apollo landed on the moon in July 1969."
+                }
+            ],
+            "insufficient_evidence": False
+        })
         mock_client.models.generate_content.return_value = mock_response
 
-        result = answer_pdf_question(pages, "When did Apollo land on the moon?", client=mock_client)
+        result = answer_pdf_question(pages, "When did Apollo land on the moon?", client=mock_client, document_id=1)
         self.assertTrue(result["success"])
         self.assertIn("July 1969", result["answer"])
         self.assertEqual(result["page_citations"], [1])
@@ -141,10 +152,14 @@ class GeminiAITestCase(unittest.TestCase):
         ]
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = "The uploaded document does not contain enough evidence to answer this question."
+        mock_response.text = json.dumps({
+            "answer": "The uploaded document does not contain enough evidence to answer this question.",
+            "citations": [],
+            "insufficient_evidence": True
+        })
         mock_client.models.generate_content.return_value = mock_response
 
-        result = answer_pdf_question(pages, "What is the capital of France?", client=mock_client)
+        result = answer_pdf_question(pages, "What is the capital of France?", client=mock_client, document_id=1)
         self.assertTrue(result["success"])
         self.assertIn("does not contain enough evidence", result["answer"])
 
@@ -501,13 +516,24 @@ startxref
         pages = [{"page_number": 1, "text": "ResNet utilizes identity skip connections.", "char_count": 42}]
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = "Direct Answer: ResNet uses skip connections [Page 1]."
+        mock_response.text = json.dumps({
+            "answer": "Direct Answer: ResNet uses skip connections [Page 1].",
+            "citations": [
+                {
+                    "evidence_id": "E1",
+                    "page_number": 1,
+                    "supporting_quote": "ResNet utilizes identity skip connections."
+                }
+            ],
+            "insufficient_evidence": False
+        })
         mock_client.models.generate_content.return_value = mock_response
 
         answer_pdf_question(
             pages,
             "How do residual connections prevent vanishing gradients?",
-            client=mock_client
+            client=mock_client,
+            document_id=1
         )
 
         call_args = mock_client.models.generate_content.call_args
@@ -1147,13 +1173,23 @@ class GeminiRetryTestCase(unittest.TestCase):
         pages = [{"page_number": 1, "text": "Grounded question context.", "char_count": 25}]
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = "Answer grounded in document [Page 1]."
+        mock_response.text = json.dumps({
+            "answer": "Answer grounded in document [Page 1].",
+            "citations": [
+                {
+                    "evidence_id": "E1",
+                    "page_number": 1,
+                    "supporting_quote": "Grounded question context."
+                }
+            ],
+            "insufficient_evidence": False
+        })
 
         timeout_err = httpx.ReadTimeout("Read timed out from server.")
         mock_client.models.generate_content.side_effect = [timeout_err, mock_response]
 
         with patch("ai.analyzer._default_sleep") as mock_sleep:
-            result = answer_pdf_question(pages, "What was found?", client=mock_client)
+            result = answer_pdf_question(pages, "What was found?", client=mock_client, document_id=1)
 
         self.assertTrue(result["success"])
         self.assertEqual(mock_client.models.generate_content.call_count, 2)
@@ -1169,7 +1205,7 @@ class GeminiRetryTestCase(unittest.TestCase):
         mock_client.models.generate_content.side_effect = connect_err
 
         with patch("ai.analyzer._default_sleep") as mock_sleep:
-            result = answer_pdf_question(pages, "What was found?", client=mock_client)
+            result = answer_pdf_question(pages, "What was found?", client=mock_client, document_id=1)
 
         self.assertFalse(result["success"])
         self.assertEqual(mock_client.models.generate_content.call_count, 2)

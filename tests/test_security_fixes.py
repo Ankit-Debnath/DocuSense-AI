@@ -269,6 +269,29 @@ class SecurityFixesTestCase(unittest.TestCase):
         # Confirm external jsdelivr CDN is NOT used
         self.assertNotIn("cdn.jsdelivr.net", html)
 
+    def test_csrf_token_endpoint_returns_valid_token(self):
+        """Confirms GET /csrf-token returns a valid CSRF token in a JSON response."""
+        res = self.client.get("/csrf-token")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("success"))
+        self.assertIn("csrf_token", data)
+        self.assertTrue(len(data["csrf_token"]) > 20)
+
+    def test_explain_page_csrf_failure_returns_json_400(self):
+        """Confirms /explain-page returns structured JSON (not HTML) on missing or expired CSRF."""
+        # Request with no CSRF token
+        res = self.client.post("/explain-page", json={
+            "stored_filename": "test.pdf",
+            "page_number": 1
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertTrue(res.is_json)
+        data = res.get_json()
+        self.assertFalse(data["success"])
+        self.assertIn("CSRF validation failed", data["error"])
+        self.assertTrue(data.get("csrf_expired"))
+
 
 if __name__ == "__main__":
     unittest.main()

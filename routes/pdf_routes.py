@@ -12,9 +12,11 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, jsonify, session
+from flask_wtf.csrf import generate_csrf
 
 from pdf_processing.validator import validate_pdf_file, generate_safe_filename
 from pdf_processing.extractor import extract_text_from_pdf
+from config import is_production_mode
 from database.models import (
     insert_document,
     get_all_documents,
@@ -42,8 +44,10 @@ if not logger.handlers:
 
 pdf_bp = Blueprint("pdf", __name__)
 
-# Maximum number of Q&A conversational turns retained in client-side session cookie
-MAX_QA_HISTORY_TURNS = 5
+# Defaults for Q&A conversational turns retained in client-side session cookie
+DEFAULT_MAX_QA_HISTORY_TURNS = 5
+DEFAULT_MAX_QA_QUESTION_CHARS = 120
+DEFAULT_MAX_QA_ANSWER_CHARS = 140
 
 
 def is_safe_redirect_url(target: str) -> bool:
@@ -102,8 +106,12 @@ def _validate_stored_filename(stored_filename: str, upload_folder: str) -> tuple
     if not clean_name or clean_name != stored_filename:
         return False, ""
 
-    resolved_folder = os.path.abspath(upload_folder)
-    resolved_path = os.path.abspath(os.path.join(resolved_folder, clean_name))
+    resolved_folder = os.path.realpath(upload_folder)
+    resolved_path = os.path.realpath(os.path.join(resolved_folder, clean_name))
+
+    # Must not resolve to the directory itself
+    if resolved_path == resolved_folder:
+        return False, ""
 
     # Must reside strictly within the uploads directory
     try:
@@ -162,7 +170,7 @@ def upload_pdf():
 
     # Validate the file (presence, extension, and PDF header signature)
     is_valid, error_message = validate_pdf_file(
-        file, 
+        file,
         current_app.config["ALLOWED_EXTENSIONS"]
     )
 
@@ -236,7 +244,26 @@ def upload_pdf():
 
     # Save the file to the dedicated uploads folder
     destination_path = os.path.join(upload_folder, safe_filename)
-    file.save(destination_path)
+    try:
+        file.save(destination_path)
+    except OSError as save_exc:
+        logger.error(
+            "[UPLOAD ERROR] Failed to save uploaded file '%s' to '%s': %s",
+            file.filename,
+            destination_path,
+            save_exc
+        )
+        if os.path.exists(destination_path):
+            try:
+                os.remove(destination_path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "[UPLOAD ERROR] Failed to clean up partial file '%s': %s",
+                    destination_path,
+                    cleanup_exc
+                )
+        flash("An error occurred while saving the uploaded file. Please try again.", "error")
+        return redirect(url_for("pdf.index"))
 
     # Extract text and metadata from the saved PDF with timing
     extract_t0 = time.perf_counter()
@@ -248,20 +275,44 @@ def upload_pdf():
         if os.path.exists(destination_path):
             try:
                 os.remove(destination_path)
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "[UPLOAD ERROR] Failed to clean up invalid PDF file '%s': %s",
+                    destination_path,
+                    cleanup_exc
+                )
         flash(extraction_result["error"] or "Failed to extract text from the PDF.", "error")
         return redirect(url_for("pdf.index"))
 
     # Persist document metadata and content hash in the SQLite database
-    insert_document(
-        filename=safe_filename,
-        original_filename=file.filename,
-        page_count=extraction_result["total_pages"],
-        character_count=extraction_result["total_characters"],
-        status="processed",
-        content_hash=content_hash
-    )
+    try:
+        insert_document(
+            filename=safe_filename,
+            original_filename=file.filename,
+            page_count=extraction_result["total_pages"],
+            character_count=extraction_result["total_characters"],
+            status="processed",
+            content_hash=content_hash
+        )
+    except Exception as db_exc:
+        logger.error(
+            "[UPLOAD ERROR] Database insertion failed for '%s' (%s). Cleaning up file '%s': %s",
+            file.filename,
+            safe_filename,
+            destination_path,
+            db_exc
+        )
+        if os.path.exists(destination_path):
+            try:
+                os.remove(destination_path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "[UPLOAD ERROR] Failed to clean up orphaned file '%s': %s",
+                    destination_path,
+                    cleanup_exc
+                )
+        flash("A database error occurred while registering the document. Please try again.", "error")
+        return redirect(url_for("pdf.index"))
 
     total_upload_ms = (time.perf_counter() - upload_t0) * 1000
     logger.info(
@@ -381,16 +432,32 @@ def view_analysis(doc_id: Optional[int] = None, stored_filename: Optional[str] =
 @pdf_bp.route("/save-key", methods=["POST"])
 def save_key():
     """
-    Saves a Gemini API key into the local .env configuration securely.
+    Handles API key management.
+    In production environments, modifying server credentials via public web requests
+    is strictly forbidden to protect against credential tampering.
+    In development environments, allows local updates only if explicitly permitted.
     """
+    is_prod = is_production_mode(current_app.config)
+    web_config_enabled = current_app.config.get("ENABLE_WEB_KEY_CONFIG", not is_prod)
+
+    if is_prod or not web_config_enabled:
+        err_msg = "API key modification via web request is disabled in production. Please set GEMINI_API_KEY in your environment."
+        if request.is_json:
+            return jsonify({"success": False, "error": err_msg}), 403
+        flash(err_msg, "error")
+        return render_template("index.html"), 403
+
     api_key = request.form.get("gemini_api_key", "").strip()
     return_url = request.form.get("return_url", "").strip()
 
     if not api_key:
         flash("API key cannot be empty.", "error")
     else:
-        save_api_key(api_key)
-        flash("Google Gemini API key saved successfully into .env!", "success")
+        success = save_api_key(api_key)
+        if success:
+            flash("Google Gemini API key saved successfully into .env!", "success")
+        else:
+            flash("Failed to save API key. Please check filesystem permissions or set GEMINI_API_KEY in your environment.", "error")
 
     if return_url and is_safe_redirect_url(return_url):
         return redirect(return_url)
@@ -514,9 +581,14 @@ def ask():
     """
     ask_t0 = time.perf_counter()
 
-    stored_filename = request.form.get("stored_filename", "").strip()
-    original_filename = request.form.get("original_filename", stored_filename)
-    question = request.form.get("question", "").strip()
+    # Support both Form submission and JSON payload
+    data = request.get_json(silent=True) if request.is_json else request.form
+    if data is None:
+        data = request.form
+
+    stored_filename = str(data.get("stored_filename", "")).strip()
+    original_filename = str(data.get("original_filename", stored_filename)).strip()
+    question = str(data.get("question", "")).strip()
 
     is_valid, file_path = _validate_stored_filename(stored_filename, current_app.config["UPLOAD_FOLDER"])
     if not is_valid:
@@ -526,12 +598,13 @@ def ask():
     history_key = f"qa_history_{stored_filename}"
 
     # Handle explicit clear conversation request
-    if request.form.get("clear_chat") == "true":
+    is_clear = str(data.get("clear_chat", "")).strip().lower() in ("true", "1")
+    if is_clear:
         session.pop(history_key, None)
         qa_history = []
         qa_result = None
         question = ""
-        if request.is_json:
+        if request.is_json or request.headers.get("Accept") == "application/json":
             return jsonify({"success": True, "cleared": True})
         extract_t0 = time.perf_counter()
         extraction_result = extract_text_from_pdf(file_path)
@@ -543,7 +616,26 @@ def ask():
         extraction_result = extract_text_from_pdf(file_path)
         extract_ms = (time.perf_counter() - extract_t0) * 1000
 
-        qa_result = answer_pdf_question(extraction_result["pages"], question)
+        # Resolve document record ID for semantic & hybrid retrieval
+        doc_record = get_document_by_filename(stored_filename)
+        if not doc_record:
+            doc_id = insert_document(
+                filename=stored_filename,
+                original_filename=original_filename,
+                page_count=extraction_result["total_pages"],
+                character_count=extraction_result["total_characters"],
+                status="processed"
+            )
+        else:
+            doc_id = doc_record["id"]
+
+        qa_result = answer_pdf_question(
+            extraction_result["pages"],
+            question,
+            document_id=doc_id,
+            file_path=file_path,
+            total_pages=extraction_result["total_pages"]
+        )
 
         total_ask_ms = (time.perf_counter() - ask_t0) * 1000
         logger.info(
@@ -556,16 +648,34 @@ def ask():
 
         qa_history = session.get(history_key, [])
         if qa_result.get("success"):
+            max_turns = current_app.config.get("MAX_QA_HISTORY_TURNS", DEFAULT_MAX_QA_HISTORY_TURNS)
+            max_q_chars = current_app.config.get("MAX_QA_QUESTION_CHARS", DEFAULT_MAX_QA_QUESTION_CHARS)
+            max_a_chars = current_app.config.get("MAX_QA_ANSWER_CHARS", DEFAULT_MAX_QA_ANSWER_CHARS)
+
+            raw_answer = qa_result.get("answer", "").strip()
+            compact_answer = raw_answer[:max_a_chars] if len(raw_answer) > max_a_chars else raw_answer
+
+            citations_for_history = qa_result.get("verified_citations") or qa_result.get("page_citations") or []
+
             qa_history.append({
-                "question": question[:300],
-                "answer": qa_result.get("answer", "")[:1500],
-                "page_citations": qa_result.get("page_citations", [])[:10],
+                "question": question[:max_q_chars],
+                "answer": compact_answer,
+                "page_citations": citations_for_history[:10],
+                "verified_citations": (qa_result.get("verified_citations") or [])[:10],
+                "citation_status": qa_result.get("citation_status", "not_applicable"),
+                "insufficient_evidence": qa_result.get("insufficient_evidence", False),
                 "model_used": qa_result.get("model_used", ""),
                 "success": True
             })
             # Bound history entries to maintain safe client-side cookie limits
-            if len(qa_history) > MAX_QA_HISTORY_TURNS:
-                qa_history = qa_history[-MAX_QA_HISTORY_TURNS:]
+            if len(qa_history) > max_turns:
+                qa_history = qa_history[-max_turns:]
+
+            # Prune any old qa_history keys from other documents to prevent cookie accumulation
+            for k in list(session.keys()):
+                if k.startswith("qa_history_") and k != history_key:
+                    session.pop(k, None)
+
             session[history_key] = qa_history
 
     # Also pass existing cached summary if available
@@ -579,8 +689,29 @@ def ask():
             "cached": True
         }
 
-    if request.is_json:
+    if request.is_json or request.headers.get("Accept") == "application/json":
         return jsonify(qa_result if qa_result else {"success": True, "cleared": True})
+
+    # Prepare display history: current turn displays full response while cookie retains bounded excerpt
+    rendered_history = [dict(item) for item in qa_history]
+    if qa_result and qa_result.get("success") and rendered_history:
+        rendered_history[-1]["answer"] = qa_result.get("answer", "")
+        rendered_history[-1]["evidence_passages"] = qa_result.get("evidence_passages", [])
+        rendered_history[-1]["citation_status"] = qa_result.get("citation_status", "not_applicable")
+        rendered_history[-1]["verified_citations"] = qa_result.get("verified_citations", [])
+    elif qa_result and qa_result.get("citation_status") == "invalid":
+        # Unsuccessful invalid turns are not persisted to session, but must be rendered for the active response
+        rendered_history.append({
+            "question": question,
+            "answer": qa_result.get("answer", ""),
+            "page_citations": qa_result.get("page_citations", []),
+            "verified_citations": qa_result.get("verified_citations", []),
+            "citation_status": "invalid",
+            "insufficient_evidence": False,
+            "evidence_passages": qa_result.get("evidence_passages", []),
+            "model_used": qa_result.get("model_used", ""),
+            "success": False
+        })
 
     enriched_pages = _enrich_pages_with_explanations(extraction_result["pages"], stored_filename)
     return render_template(
@@ -593,7 +724,7 @@ def ask():
         pages=enriched_pages,
         summary_result=summary_result,
         qa_result=qa_result,
-        qa_history=qa_history,
+        qa_history=rendered_history,
         last_question=question
     )
 
@@ -685,3 +816,13 @@ def explain_page():
     )
 
     return jsonify(result)
+
+
+@pdf_bp.route("/csrf-token", methods=["GET"])
+def get_csrf_token():
+    """
+    Returns a fresh CSRF token for asynchronous client requests.
+    Enables automatic token renewal without requiring a full page refresh.
+    """
+    token = generate_csrf()
+    return jsonify({"success": True, "csrf_token": token})
