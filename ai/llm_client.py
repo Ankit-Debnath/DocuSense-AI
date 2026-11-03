@@ -5,9 +5,12 @@ Configures HTTP timeouts and avoids indefinite hangs.
 Never hardcodes, logs, or exposes API keys.
 """
 
+import logging
 import os
 from typing import Optional
 from flask import current_app
+
+logger = logging.getLogger("pdf_analyzer.llm_client")
 
 try:
     from google import genai
@@ -16,6 +19,7 @@ except ImportError:
 
 # Default model offering lowest latency (~3s) for document summarization & QA
 DEFAULT_FAST_MODEL = "gemini-flash-lite-latest"
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 DEFAULT_TIMEOUT_SECONDS = 30
 
 
@@ -103,6 +107,39 @@ def get_model_name() -> str:
     return DEFAULT_FAST_MODEL
 
 
+def get_embedding_model_name() -> str:
+    """
+    Retrieves the configured Gemini embedding model name with fallback to DEFAULT_EMBEDDING_MODEL.
+    """
+    env_path = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("EMBEDDING_MODEL="):
+                        _, _, val = stripped.partition("=")
+                        val = val.strip().strip("'\"")
+                        if val:
+                            return val
+        except Exception:
+            pass
+
+    model = os.environ.get("EMBEDDING_MODEL")
+    if model and model.strip():
+        return model.strip()
+
+    try:
+        if current_app:
+            model = current_app.config.get("EMBEDDING_MODEL")
+            if model and model.strip():
+                return model.strip()
+    except RuntimeError:
+        pass
+
+    return DEFAULT_EMBEDDING_MODEL
+
+
 def get_timeout_seconds() -> int:
     """
     Retrieves the configured client timeout in seconds.
@@ -126,40 +163,53 @@ def save_api_key(api_key: str) -> bool:
     """
     Saves the provided API key to the local .env file and active environment.
     Never exposes or logs the key.
+    Refuses execution in production mode to prevent credential tampering.
     """
+    try:
+        from config import is_production_mode
+        if is_production_mode(current_app.config if current_app else None):
+            logger.warning("save_api_key called in production mode. File modification is forbidden.")
+            return False
+    except (ImportError, RuntimeError):
+        pass
+
     clean_key = (api_key or "").strip()
     if not clean_key:
         return False
 
-    os.environ["GEMINI_API_KEY"] = clean_key
-    try:
-        if current_app:
-            current_app.config["GEMINI_API_KEY"] = clean_key
-    except RuntimeError:
-        pass
-
     env_path = os.path.join(os.path.abspath(os.path.dirname(os.path.dirname(__file__))), ".env")
     lines = []
     found = False
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+    try:
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
 
-    new_lines = []
-    for line in lines:
-        if line.strip().startswith("GEMINI_API_KEY="):
-            new_lines.append(f"GEMINI_API_KEY={clean_key}\n")
-            found = True
-        else:
-            new_lines.append(line)
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith("GEMINI_API_KEY="):
+                new_lines.append(f"GEMINI_API_KEY={clean_key}\n")
+                found = True
+            else:
+                new_lines.append(line)
 
-    if not found:
-        new_lines.append(f"\nGEMINI_API_KEY={clean_key}\n")
+        if not found:
+            new_lines.append(f"\nGEMINI_API_KEY={clean_key}\n")
 
-    with open(env_path, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
 
-    return True
+        os.environ["GEMINI_API_KEY"] = clean_key
+        try:
+            if current_app:
+                current_app.config["GEMINI_API_KEY"] = clean_key
+        except RuntimeError:
+            pass
+
+        return True
+    except (OSError, IOError) as exc:
+        logger.warning("Failed to persist API key to .env: %s", exc)
+        return False
 
 
 def create_gemini_client(api_key: Optional[str] = None, timeout_seconds: Optional[int] = None):
