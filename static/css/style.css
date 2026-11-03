@@ -526,6 +526,10 @@ h1 {
 .qa-assistant-label {
     flex-shrink: 0;
     padding-top: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    align-items: flex-start;
 }
 
 .assistant-badge {
@@ -539,6 +543,94 @@ h1 {
     border: 1px solid #bfdbfe;
     padding: 0.2rem 0.55rem;
     border-radius: 4px;
+}
+
+/* Grounded RAG Status Badges */
+.qa-status-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.15rem 0.5rem;
+    border-radius: 9999px;
+    display: inline-flex;
+    align-items: center;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+}
+
+.badge-verified {
+    background-color: #ecfdf5;
+    color: #065f46;
+    border: 1px solid #a7f3d0;
+}
+
+.badge-warning {
+    background-color: #fffbeb;
+    color: #92400e;
+    border: 1px solid #fde68a;
+}
+
+.badge-abstention {
+    background-color: #fef3c7;
+    color: #78350f;
+    border: 1px solid #fcd34d;
+}
+
+/* Honest Abstention Presentation */
+.qa-abstention-card {
+    background-color: #fffbeb;
+    border: 1px solid #fde68a;
+    border-left: 4px solid #f59e0b;
+    border-radius: 6px;
+    padding: 0.85rem 1.1rem;
+    color: #78350f;
+}
+
+.qa-abstention-header {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.35rem;
+}
+
+.icon-abstention {
+    color: #d97706;
+    flex-shrink: 0;
+}
+
+.qa-abstention-title {
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: #92400e;
+}
+
+.qa-abstention-message {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: #78350f;
+}
+
+/* Verification Error Accordion */
+.citation-errors-accordion {
+    margin-top: 0.65rem;
+    background-color: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    font-size: 0.8rem;
+}
+
+.citation-errors-summary {
+    padding: 0.45rem 0.75rem;
+    font-weight: 600;
+    color: #92400e;
+    cursor: pointer;
+}
+
+.citation-errors-list {
+    margin: 0;
+    padding: 0.4rem 1.25rem 0.6rem 1.25rem;
+    color: #78350f;
 }
 
 .qa-answer-bubble {
@@ -671,6 +763,50 @@ details[open] > .evidence-summary-toggle .evidence-chevron {
     justify-content: space-between;
     align-items: center;
     margin-bottom: 0.45rem;
+}
+
+.evidence-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+.evidence-id-badge {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #475569;
+    background-color: #e2e8f0;
+    border: 1px solid #cbd5e1;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    letter-spacing: 0.02em;
+}
+
+.evidence-quote-section {
+    margin: 0.45rem 0 0.55rem 0;
+    padding: 0.45rem 0.75rem;
+    background-color: #f1f5f9;
+    border-left: 3px solid #3b82f6;
+    border-radius: 0 4px 4px 0;
+}
+
+.evidence-quote-label {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin-bottom: 0.2rem;
+}
+
+.evidence-quote-snippet {
+    margin: 0;
+    font-size: 0.85rem;
+    font-style: italic;
+    color: #1e293b;
+    line-height: 1.5;
+    word-break: break-word;
 }
 
 .evidence-tag {
@@ -1131,6 +1267,20 @@ button.page-citation-pill:hover {
     transform: translateY(-1px);
 }
 
+/* Unverified Page Citation Pill */
+button.page-citation-pill.page-citation-pill-unverified,
+.page-citation-pill.page-citation-pill-unverified {
+    background-color: #fef3c7;
+    border: 1px dashed #f59e0b;
+    color: #92400e;
+}
+
+button.page-citation-pill.page-citation-pill-unverified:hover {
+    background-color: #f59e0b;
+    color: #ffffff;
+    border-color: #d97706;
+}
+
 /* Mobile Responsiveness for Q&A and Page Accordion */
 @media (max-width: 640px) {
     .qa-card {
@@ -1151,6 +1301,15 @@ button.page-citation-pill:hover {
     .qa-answer-row {
         flex-direction: column;
         gap: 0.35rem;
+    }
+
+    .qa-user-label,
+    .qa-assistant-label {
+        min-width: unset;
+        flex-direction: row;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.4rem;
     }
 
     .section-header-bar {

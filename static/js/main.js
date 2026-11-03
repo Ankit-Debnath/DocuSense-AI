@@ -11,11 +11,47 @@ function escapeHtml(str) {
 }
 
 /**
- * Retrieves the active CSRF token from the page meta tag if available.
+ * Retrieves the active CSRF token from page meta tag or form input.
  */
 function getCSRFToken() {
     const meta = document.querySelector('meta[name="csrf-token"]');
-    return meta ? meta.getAttribute("content") : "";
+    if (meta && meta.getAttribute("content")) {
+        return meta.getAttribute("content").trim();
+    }
+    const input = document.querySelector('input[name="csrf_token"]');
+    if (input && input.value) {
+        return input.value.trim();
+    }
+    return "";
+}
+
+/**
+ * Fetches a fresh CSRF token from the server and updates DOM elements.
+ */
+async function refreshCSRFToken() {
+    try {
+        const res = await fetch("/csrf-token", {
+            headers: {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json"
+            }
+        });
+        if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.csrf_token) {
+                const newToken = data.csrf_token;
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                if (meta) meta.setAttribute("content", newToken);
+                document.querySelectorAll('input[name="csrf_token"]').forEach(el => {
+                    el.value = newToken;
+                });
+                return newToken;
+            }
+        }
+    } catch (e) {
+        console.warn("Could not refresh CSRF token automatically:", e);
+    }
+    return null;
 }
 
 /**
@@ -24,7 +60,7 @@ function getCSRFToken() {
  * enhances page citation tags into interactive pills, and sanitizes via DOMPurify.
  * If DOMPurify is unavailable, fails closed by returning escaped plain text.
  */
-function formatMarkdownToSafeHtml(rawMarkdown) {
+function formatMarkdownToSafeHtml(rawMarkdown, isVerified = true) {
     const text = (rawMarkdown || "").trim();
     if (!text) return "";
 
@@ -90,8 +126,11 @@ function formatMarkdownToSafeHtml(rawMarkdown) {
     }
 
     // D. Enhance Page Citations [Page X], [Pages X–Y], [Pages X-Y] into interactive jump pills
-    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\s*[–-]\s*(\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Pages $1–$2">Pages $1–$2</button>');
-    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\]/gi, '<button type="button" class="page-citation-pill" data-page="$1" title="Jump to Page $1">Page $1</button>');
+    const pillClass = isVerified ? "page-citation-pill" : "page-citation-pill page-citation-pill-unverified";
+    const pillSuffix = isVerified ? "" : " (Unverified citation)";
+    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\s*[–-]\s*(\d+)\]/gi, `<button type="button" class="${pillClass}" data-page="$1" title="Jump to Pages $1–$2${pillSuffix}">Pages $1–$2</button>`);
+    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\s*,\s*(\d+)\]/gi, `<button type="button" class="${pillClass}" data-page="$1" title="Jump to Page $1${pillSuffix}">Page $1</button>, <button type="button" class="${pillClass}" data-page="$2" title="Jump to Page $2${pillSuffix}">Page $2</button>`);
+    rawHtml = rawHtml.replace(/\[Pages?\s+(\d+)\]/gi, `<button type="button" class="${pillClass}" data-page="$1" title="Jump to Page $1${pillSuffix}">Page $1</button>`);
 
     // E. Sanitize with DOMPurify to guarantee XSS prevention
     const cleanHtml = DOMPurify.sanitize(rawHtml, {
@@ -104,7 +143,7 @@ function formatMarkdownToSafeHtml(rawMarkdown) {
             'table', 'thead', 'tbody', 'tr', 'th', 'td',
             'a', 'span', 'div', 'button'
         ],
-        ALLOWED_ATTR: ['href', 'target', 'rel', 'class', 'id', 'title', 'type', 'data-page'],
+        ALLOWED_ATTR: ['href', 'target', 'rel', 'class', 'id', 'title', 'type', 'data-page', 'data-citation-status'],
         FORBID_TAGS: ['script', 'style', 'iframe', 'frame', 'object', 'embed', 'form', 'input'],
         FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur', 'style']
     });
@@ -205,7 +244,11 @@ function renderMarkdownQAAnswers() {
         const rawText = (rawElement.textContent || "").trim();
         if (!rawText) return;
 
-        const cleanHtml = formatMarkdownToSafeHtml(rawText);
+        // Turn-specific citation verification status: defaults to unverified unless explicitly 'verified'
+        const citStatus = container.getAttribute("data-citation-status") || "not_applicable";
+        const isVerified = (citStatus === "verified");
+
+        const cleanHtml = formatMarkdownToSafeHtml(rawText, isVerified);
         formattedElement.innerHTML = cleanHtml;
         container.setAttribute("data-rendered", "true");
 
@@ -301,29 +344,64 @@ function bindPageExplanationActions() {
             btn.disabled = true;
 
             try {
-                const csrfInput = document.querySelector('input[name="csrf_token"]');
-                const csrfToken = csrfInput ? csrfInput.value : getCSRFToken();
+                let csrfToken = getCSRFToken();
 
-                const formData = new FormData();
-                formData.append("csrf_token", csrfToken);
-                formData.append("stored_filename", storedFilename);
-                formData.append("original_filename", originalFilename);
-                formData.append("page_number", pageNum);
+                const requestPayload = {
+                    csrf_token: csrfToken,
+                    stored_filename: storedFilename,
+                    original_filename: originalFilename,
+                    page_number: pageNum
+                };
                 if (isRegenerate) {
-                    formData.append("regenerate", "true");
+                    requestPayload.regenerate = true;
                 }
 
-                const response = await fetch("/explain-page", {
-                    method: "POST",
-                    body: formData,
-                    headers: {
-                        "X-Requested-With": "XMLHttpRequest"
+                // Helper to perform the explain fetch with headers and body
+                const performExplainRequest = async (tokenToUse) => {
+                    requestPayload.csrf_token = tokenToUse;
+                    return await fetch("/explain-page", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "X-CSRFToken": tokenToUse,
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Accept": "application/json"
+                        },
+                        body: JSON.stringify(requestPayload)
+                    });
+                };
+
+                let response = await performExplainRequest(csrfToken);
+
+                // Handle token expiration: attempt automatic CSRF token refresh and single retry
+                if (response.status === 400) {
+                    let peekData = null;
+                    const contentType = response.headers.get("content-type") || "";
+                    if (contentType.includes("application/json")) {
+                        try {
+                            peekData = await response.clone().json();
+                        } catch (_) {}
                     }
-                });
+                    if (!contentType.includes("application/json") || peekData?.csrf_expired || (peekData?.error && peekData.error.toLowerCase().includes("csrf"))) {
+                        const freshToken = await refreshCSRFToken();
+                        if (freshToken) {
+                            csrfToken = freshToken;
+                            response = await performExplainRequest(freshToken);
+                        }
+                    }
+                }
 
-                const data = await response.json();
+                let data;
+                const finalContentType = response.headers.get("content-type") || "";
+                if (finalContentType.includes("application/json")) {
+                    data = await response.json();
+                } else {
+                    const textResponse = await response.text();
+                    console.warn("Unexpected non-JSON response from /explain-page:", textResponse.slice(0, 150));
+                    throw new Error(response.status === 400 ? "Security token expired. Please refresh the page." : "Server returned an invalid response.");
+                }
 
-                if (data.success && data.explanation) {
+                if (response.ok && data.success && data.explanation) {
                     if (textContainer) {
                         const cleanHtml = formatMarkdownToSafeHtml(data.explanation);
                         textContainer.innerHTML = cleanHtml;
@@ -376,7 +454,9 @@ function bindPageExplanationActions() {
                 }
             } catch (err) {
                 console.error("Page explanation request failed:", err);
-                const errMsg = "An error occurred while communicating with the server. Please check your connection.";
+                const errMsg = err && err.message && !err.message.includes("fetch") && !err.message.includes("JSON")
+                    ? err.message
+                    : "An error occurred while communicating with the server. Please check your connection or refresh the page.";
                 if (errorBox) {
                     const msgEl = errorBox.querySelector(".error-msg");
                     if (msgEl) msgEl.textContent = errMsg;

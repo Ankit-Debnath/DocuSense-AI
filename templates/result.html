@@ -130,7 +130,7 @@
             <input type="hidden" name="stored_filename" value="{{ stored_filename }}">
             <input type="hidden" name="original_filename" value="{{ filename }}">
             <div class="qa-input-wrapper">
-                <input type="text" name="question" id="qa-input-field" placeholder="Ask anything about this document (e.g. What are the key findings or formulas?)..." value="" required class="qa-input" autocomplete="off">
+                <input type="text" name="question" id="qa-input-field" aria-label="Ask a question about this document" placeholder="Ask anything about this document (e.g. What are the key findings or formulas?)..." value="" required class="qa-input" autocomplete="off">
                 <button type="submit" id="qa-btn" class="btn-primary btn-qa">
                     <svg class="btn-send-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -148,19 +148,23 @@
         </div>
 
         <!-- Error Alert -->
-        {% if qa_result and not qa_result.success %}
+        {% if qa_result and not qa_result.success and qa_result.citation_status != 'invalid' %}
             <div class="alert alert-error">
                 {{ qa_result.error }}
             </div>
         {% endif %}
 
         <!-- Conversation History / Turn Cards -->
-        {% set conversation_items = qa_history if (qa_history and qa_history|length > 0) else ([{'question': last_question, 'answer': qa_result.answer, 'page_citations': qa_result.page_citations, 'evidence_passages': qa_result.get('evidence_passages', []), 'model_used': qa_result.model_used, 'success': qa_result.success}] if (qa_result and qa_result.success) else []) %}
+        {% set has_active_in_history = (qa_history and qa_history|length > 0 and qa_result and qa_history[-1].question == last_question and qa_history[-1].citation_status == qa_result.get('citation_status', 'not_applicable')) %}
+        {% set active_unpersisted_turn = {'question': last_question, 'answer': qa_result.answer, 'page_citations': qa_result.page_citations, 'verified_citations': qa_result.get('verified_citations', []), 'citation_status': qa_result.get('citation_status', 'not_applicable'), 'insufficient_evidence': qa_result.get('insufficient_evidence', False), 'evidence_passages': qa_result.get('evidence_passages', []), 'model_used': qa_result.model_used, 'success': qa_result.success} if (qa_result and (qa_result.success or qa_result.citation_status == 'invalid') and not has_active_in_history) else None %}
+        {% set base_conversation_items = qa_history if qa_history else [] %}
+        {% set conversation_items = (base_conversation_items + [active_unpersisted_turn]) if active_unpersisted_turn else base_conversation_items %}
 
         {% if conversation_items %}
         <div class="qa-conversation-container">
             {% for item in conversation_items %}
-            <div class="qa-turn-card">
+            {% set is_active_turn = loop.last and qa_result %}
+            <div class="qa-turn-card" data-citation-status="{{ item.citation_status | default('not_applicable') }}">
                 <!-- User Question Row -->
                 <div class="qa-question-row">
                     <div class="qa-user-label">
@@ -175,18 +179,52 @@
                 <div class="qa-answer-row">
                     <div class="qa-assistant-label">
                         <span class="assistant-badge">Answer</span>
+                        {% if item.insufficient_evidence %}
+                        <span class="qa-status-badge badge-abstention" title="Document does not contain sufficient authoritative evidence">Insufficient Evidence</span>
+                        {% elif item.citation_status == 'verified' %}
+                        <span class="qa-status-badge badge-verified" title="Citations strictly verified against authoritative document evidence">Verified Citations</span>
+                        {% elif item.citation_status == 'invalid' %}
+                        <span class="qa-status-badge badge-warning" title="Generated citations could not be verified against retrieved passages">Citations Unverified</span>
+                        {% elif item.citation_status == 'legacy_unverified' %}
+                        <span class="qa-status-badge badge-warning" title="Legacy response format; citations unverified">Legacy — Unverified</span>
+                        {% endif %}
                     </div>
                     <div class="qa-answer-bubble">
-                        <div class="qa-answer-markdown" data-qa-answer="true">
+                        {% if item.insufficient_evidence %}
+                        <div class="qa-abstention-card">
+                            <div class="qa-abstention-header">
+                                <svg class="icon-abstention" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                                </svg>
+                                <span class="qa-abstention-title">Insufficient Document Evidence</span>
+                            </div>
+                            <p class="qa-abstention-message">DocuSense cannot provide a reliable answer because the uploaded document does not contain sufficient supporting evidence.</p>
+                        </div>
+                        {% else %}
+                        <div class="qa-answer-markdown" data-qa-answer="true" data-citation-status="{{ item.citation_status | default('not_applicable') }}">
                             <!-- Preserved raw answer for JS markdown parser and automated tests -->
                             <div class="qa-raw-text" style="display: none;">{{ item.answer }}</div>
                             <div class="qa-formatted-answer">{{ item.answer }}</div>
                         </div>
+                        {% endif %}
+
+                        {% if item.citation_status == 'invalid' and is_active_turn and qa_result.citation_errors %}
+                        <details class="citation-errors-accordion">
+                            <summary class="citation-errors-summary">Verification Notes ({{ qa_result.citation_errors|length }})</summary>
+                            <ul class="citation-errors-list">
+                                {% for err in qa_result.citation_errors %}
+                                <li>{{ err }}</li>
+                                {% endfor %}
+                            </ul>
+                        </details>
+                        {% endif %}
                     </div>
                 </div>
 
                 <!-- Grounded Evidence Passages (Expandable / Collapsible) -->
-                {% if item.evidence_passages and item.evidence_passages|length > 0 %}
+                {% if item.evidence_passages and item.evidence_passages|length > 0 and not item.insufficient_evidence %}
                 <div class="qa-evidence-section">
                     <details class="evidence-accordion" open>
                         <summary class="evidence-summary-toggle">
@@ -203,11 +241,30 @@
                         </summary>
                         <div class="evidence-grid">
                             {% for passage in item.evidence_passages %}
-                            <div class="evidence-card">
+                            {% set ns = namespace(quote=None) %}
+                            {% if is_active_turn and qa_result.citations %}
+                                {% for cit in qa_result.citations %}
+                                    {% if cit.evidence_id == passage.evidence_id and not ns.quote %}
+                                        {% set ns.quote = cit.supporting_quote %}
+                                    {% endif %}
+                                {% endfor %}
+                            {% endif %}
+                            <div class="evidence-card" id="evidence-{{ passage.evidence_id }}">
                                 <div class="evidence-card-header">
-                                    <button type="button" class="page-citation-pill" data-page="{{ passage.page_number }}" title="Jump to Page {{ passage.page_number }}">Page {{ passage.page_number }}</button>
+                                    <div class="evidence-header-left">
+                                        {% if passage.evidence_id %}
+                                        <span class="evidence-id-badge">{{ passage.evidence_id }}</span>
+                                        {% endif %}
+                                        <button type="button" class="page-citation-pill" data-page="{{ passage.page_number }}" title="Jump to Page {{ passage.page_number }}">Page {{ passage.page_number }}</button>
+                                    </div>
                                     <span class="evidence-tag">Source Context</span>
                                 </div>
+                                {% if ns.quote %}
+                                <div class="evidence-quote-section">
+                                    <span class="evidence-quote-label">Verified Supporting Quote:</span>
+                                    <blockquote class="evidence-quote-snippet">"{{ ns.quote }}"</blockquote>
+                                </div>
+                                {% endif %}
                                 <div class="evidence-card-body">
                                     <p class="evidence-text">{{ passage.text }}</p>
                                 </div>
@@ -216,12 +273,13 @@
                         </div>
                     </details>
                 </div>
-                {% elif item.page_citations and item.page_citations|length > 0 %}
+                {% elif (item.verified_citations or item.page_citations) and not item.insufficient_evidence %}
                 <div class="qa-citations-bar">
                     <span class="citation-label">Evidence Citations:</span>
                     <div class="citation-pills-list">
-                        {% for page in item.page_citations %}
-                        <button type="button" class="page-citation-pill" data-page="{{ page }}" title="Jump to Page {{ page }}">Page {{ page }}</button>
+                        {% set cits_to_show = item.verified_citations if (item.citation_status == 'verified' and item.verified_citations) else item.page_citations %}
+                        {% for page in cits_to_show %}
+                        <button type="button" class="page-citation-pill{% if item.citation_status not in ('verified', 'not_applicable') %} page-citation-pill-unverified{% endif %}" data-page="{{ page }}" title="Jump to Page {{ page }}">Page {{ page }}</button>
                         {% endfor %}
                     </div>
                 </div>
